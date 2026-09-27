@@ -1,87 +1,115 @@
-# SSRF via API Bridge "Dynamic Bearer Token → Token Authentication URL" (second unvalidated fetch path)
+# Unauthenticated disclosure of account owner's name and email via public connection-setup-link endpoint
 
-**Program:** Two Minute Reports — Bug Bounty / VDP
+**Program:** Two Minute Reports — Bug Bounty / VDP (`https://www.twominutereports.com/bug-bounty`)
 **Target asset:** `https://hub.twominutereports.com`
-**Vulnerability class:** Server-Side Request Forgery (SSRF) — CWE-918
-**Severity:** **High** — CVSS 3.1 **8.6** — `AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N`
-**Status:** Confirmed (differential proof)
-**Relationship:** **Same root cause as Finding #1** (API Bridge performs server-side fetches of user-supplied URLs with no egress validation). This report documents a **second, independent code path** so the fix covers all of them. Can be triaged as one issue.
+**Vulnerability class:** Exposure of sensitive information to an unauthorized actor (CWE-200 / CWE-359), pre-authentication
+**Severity:** **Medium** — CVSS 3.1 **4.3** — `AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N`
+**Status:** Confirmed, reproduced, repeatable
+**Date:** 2026-09-27
+
+> Severity note: modelled as `PR:L` because exploitation requires possession of a valid connection **setup link** — a capability token the product is designed to hand to third parties. No Two Minute Reports account, password, or API key is required. Modelled as `PR:N` (no token precondition at all) the score would be CVSS **5.3**; either way the finding is **Medium**.
 
 ---
 
 ## 1. Summary
 
-The API Bridge connector supports a **"Dynamic Bearer Token"** authorization mode. In this mode the Two Minute Reports backend first makes a **server-side request to a user-supplied "Token Authentication URL"** (`dynamicTokenAuthSuffixUrl`, appended to `baseUrl`) to mint an access token, then makes the data request.
+The connector **"Share a setup link"** feature lets an account owner delegate connector setup to an outside party, who can complete it **without signing in**. The link takes the form `https://hub.twominutereports.com/connect/<JWT>` and is resolved by a family of **`public/` (unauthenticated) API endpoints**.
 
-This **token-minting fetch is a separate SSRF sink** from the data fetch in Finding #1, and it is **equally unvalidated** — it will connect to internal, link-local, and loopback destinations. It was confirmed reaching the cloud metadata service at `169.254.169.254`.
+One of these, `POST /rmtipa/platform/public/connection-setup-link/context`, returns metadata about the link so the recipient's UI can show who invited them. In doing so it **discloses the inviting account owner's full name and email address** (plus the team name) to **anyone who holds the link, with no authentication of any kind**.
 
-Because a single user-controlled `baseUrl`/suffix drives the fetch, and no scheme/host/IP filtering is applied, any authenticated user (free trial, or a `tmrc_live_` API key) can force the backend to issue requests to internal network destinations via this path.
+Setup links are, by design, distributed to parties outside the account owner's organisation (agencies, clients, freelancers) and routinely travel over email and chat, where they can be forwarded, logged, or leaked via referrers. Any such recipient — intended or not — can read the owner's email address. The endpoint is **repeatable** for the link's 7-day lifetime.
+
+This report covers **only** the unauthenticated PII disclosure. The server-side request forgery in the sibling `…/test` endpoint is documented separately.
 
 ---
 
-## 2. Affected component
+## 2. Affected endpoint
 
 | Item | Value |
 |---|---|
-| Endpoint | `POST https://hub.twominutereports.com/rmtipa/platform/test-connection` |
-| Mode | `"authorization":"dynamicBearerToken"` |
-| Vulnerable field | `dynamicTokenAuthSuffixUrl` (fetched server-side, appended to `baseUrl`) |
-| Auth required | User session token **or** `tmrc_live_` API key (free trial sufficient) |
-| Persistence | None (`isApibridgeTestConnection:true` is a probe) |
+| Endpoint | `POST https://hub.twominutereports.com/rmtipa/platform/public/connection-setup-link/context` |
+| Auth required | **None** — no `Authorization` header is sent |
+| Precondition | Possession of one valid, unexpired setup-link JWT (`…/connect/<JWT>`) |
+| Data disclosed | `invitedBy.name`, `invitedBy.email`, `teamName` |
+| Repeatable? | **Yes** — the `context` call does not consume the link (only `…/save` does) |
+
+The setup-link JWT is `HS256` with payload `{"setupLinkId":"<uuid>","type":"connection_setup_link","iat":…,"exp":+7d}`. The signature is correctly verified (forgery attempts — `alg:none`, algorithm-confusion, signature-stripping — were all rejected), so the link cannot be minted by an attacker. The issue is the data that the **valid** unauthenticated flow returns to whoever holds the link.
 
 ---
 
-## 3. Proof of Concept (differential — proves the token URL is fetched server-side and reaches internal)
+## 3. Setup / prerequisites
 
-Both requests set `baseUrl=http://169.254.169.254` and drive the **token-auth** fetch via `dynamicTokenAuthSuffixUrl`. The two different internal responses prove the request left TMR's backend and hit the internal metadata service.
+- **No Two Minute Reports account is required** to call the endpoint.
+- The attacker needs one valid, unexpired **setup link**. In the intended workflow these are generated by TMR users and sent to third parties to connect data sources.
+- Tooling: any HTTP client (`curl`, Burp Repeater).
 
-**A) Reachable internal path → HTTP 200 body returned (no `access_token` field in the YAML):**
+*(For a self-contained reproduction, a link can be minted with a normal user token via `POST /rmtipa/platform/generate-connection-setup-link` `{"connectorId":"apibridge","connectionName":"x"}`. Minting the link is the ordinary intended action; the finding is in what the unauthenticated `context` endpoint then returns.)*
+
+---
+
+## 4. Proof of Concept
+
+Let `JWT` be the token from a setup link (`…/connect/<JWT>`).
+
 ```bash
-curl -s 'https://hub.twominutereports.com/rmtipa/platform/test-connection' \
- -H 'Authorization: Bearer <TOKEN-or-tmrc_live_key>' -H 'Content-Type: application/json' \
- --data '{"connection":{"name":"p","baseUrl":"http://169.254.169.254","authorization":"dynamicBearerToken","isApibridgeTestConnection":true,"headers":[],"dynamicTokenAuthSuffixUrl":"/hetzner/v1/metadata","dynamicTokenPath":"access_token","tokenHeader":"Authorization: Bearer {{token}}","dynamicTokenMethod":"get","query":{"method":"get","urlSuffix":"/hetzner/v1/metadata"},"dataSourceType":"apibridge"}}'
+curl -s 'https://hub.twominutereports.com/rmtipa/platform/public/connection-setup-link/context' \
+  -H 'Content-Type: application/json' \
+  --data '{"token":"<JWT>"}'
 ```
-→ `{"code":"VALIDATION_FAILED","message":"Unable to find the dynamic access token in the response",...}`
-(The server fetched the metadata document — a 200 with a body — but couldn't locate the `access_token` JSON field in it.)
 
-**B) Same internal host, non-existent path → the internal service's own 404:**
-```bash
-# ...identical, but dynamicTokenAuthSuffixUrl="/nonexistent-xyz"
-```
-→ `{"code":"CONNECTION_CREDENTIALS_MISSING","message":"Error 404, Not Found...",...}`
-
-**Interpretation:** `200-with-body` for the real metadata path vs `404` for a bogus path — **both from `169.254.169.254`** — confirms the token-auth fetch reaches internal link-local destinations. (See `evidence-tokenauth-ssrf.txt`.)
-
----
-
-## 4. Impact
-
-- Confirms the SSRF is **not limited to the single data-fetch code path** — the token-auth fetch is a second sink with identical lack of validation. A partial fix that only guards the data URL would leave this exploitable.
-- Usable as a **blind SSRF for internal reconnaissance / port- and service-scanning** via response differentials (`200 body` vs `404` vs connection-refused vs timeout).
-- **Escalation (noted, not weaponised):** the value extracted by `dynamicTokenPath` from the token-auth response is injected into `tokenHeader` and sent on the *data* request. Pointing the token-auth fetch at an internal **JSON** endpoint and the data fetch at an attacker-controlled host would let a specific internal field value be **exfiltrated in-band** — turning this path into a read primitive for internal JSON services and an outbound exfiltration channel.
-
----
-
-## 5. Remediation
-
-Apply the **same egress validation as Finding #1** to the `dynamicTokenAuthSuffixUrl` fetch (and any other server-side fetch in the connector): allow only `http(s)`, reject private/link-local/loopback/reserved IPs after DNS resolution, re-validate on redirects. Centralise all outbound-fetch construction behind one hardened HTTP client so every code path is covered.
-
----
-
-## 6. Reference schema (Dynamic Bearer Token)
+**No `Authorization` header is sent.** Observed response (`HTTP 200`):
 
 ```json
-{"connection":{
-  "name":"API Bridge",
-  "baseUrl":"<attacker-controlled>",
-  "authorization":"dynamicBearerToken",
-  "isApibridgeTestConnection":true,
-  "headers":[],
-  "dynamicTokenAuthSuffixUrl":"<attacker-controlled — fetched server-side>",
-  "dynamicTokenPath":"access_token",
-  "tokenHeader":"Authorization: Bearer {{token}}",
-  "dynamicTokenMethod":"get",
-  "query":{"method":"get","urlSuffix":"<attacker-controlled>"},
-  "dataSourceType":"apibridge"
-}}
+{
+  "connectorId": "apibridge",
+  "connectionName": "x",
+  "mode": "create",
+  "teamName": "Hg266087's Team",
+  "invitedBy": {
+    "name": "Hg266087",
+    "email": "hg266087@gmail.com"
+  },
+  "status": "success"
+}
 ```
+
+The `invitedBy.email` and `invitedBy.name` fields are the account owner's real registered name and email address. The call succeeds with no credentials and can be repeated for the link's lifetime.
+
+End-to-end automation: `poc-unauth.sh` (step 2 is this unauthenticated `context` call; it sends no `Authorization` header).
+
+---
+
+## 5. Impact
+
+Any party who receives or intercepts a setup link — including outside the intended recipient — can, **without any Two Minute Reports account or authentication**, obtain the inviting account owner's:
+
+- **Email address** (personal/registered) — usable for targeted phishing, credential-stuffing correlation, and account enumeration.
+- **Full name / display name.**
+- **Team name.**
+
+Because setup links are deliberately distributed to third parties and travel over channels that leak (email forwarding, chat, referrer headers, server logs), the exposed email address reaches a wider audience than the account owner intends. The disclosure is low in volume per link but requires no privileges and is fully repeatable, making it a reliable owner-email oracle for any link that leaks.
+
+---
+
+## 6. Remediation
+
+1. **Remove the email address from the `context` response.** The recipient UI does not need the inviter's email; a display name (or the team name alone) is sufficient to establish trust in the invitation.
+2. If an inviter identity must be shown, prefer a **non-sensitive display name** over any contact address, and never return the raw registered email on an unauthenticated endpoint.
+3. Consider requiring the recipient to be an **authenticated user** before returning any inviter identity, and **rate-limit** the `public/connection-setup-link/*` endpoints.
+4. Shorten the setup-link lifetime and allow the inviter to **revoke** a link.
+
+---
+
+## 7. Scope & rules-of-engagement compliance
+
+- Testing used **only the researcher's own account and setup link**; the only account data disclosed was the researcher's own (`Hg266087` / `hg266087@gmail.com`).
+- No other user's data was accessed; no enumeration or volume testing was performed.
+- The `context` call is read-only and does not persist or consume anything.
+
+---
+
+## 8. Evidence files (this folder)
+
+| File | Contents |
+|---|---|
+| `poc-unauth.sh` | End-to-end PoC; **step 2** is the unauthenticated `context` call demonstrated here |
