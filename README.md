@@ -1,115 +1,104 @@
-# Unauthenticated disclosure of account owner's name and email via public connection-setup-link endpoint
+# Stored HTML/CSS Injection in MyConfigura Briefcase → full-page phishing overlay on app.configura.com
 
-**Program:** Two Minute Reports — Bug Bounty / VDP (`https://www.twominutereports.com/bug-bounty`)
-**Target asset:** `https://hub.twominutereports.com`
-**Vulnerability class:** Exposure of sensitive information to an unauthorized actor (CWE-200 / CWE-359), pre-authentication
-**Severity:** **Medium** — CVSS 3.1 **4.3** — `AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N`
-**Status:** Confirmed, reproduced, repeatable
-**Date:** 2026-09-27
-
-> Severity note: modelled as `PR:L` because exploitation requires possession of a valid connection **setup link** — a capability token the product is designed to hand to third parties. No Two Minute Reports account, password, or API key is required. Modelled as `PR:N` (no token precondition at all) the score would be CVSS **5.3**; either way the finding is **Medium**.
+**Program:** Configura Security Bug Bounty Program 
+**Scope asset:** `*.configura.com` (in scope)
+**Affected host:** `https://app.configura.com` (MyConfigura) — API `https://www2.configura.com/api/v3`
+**Severity:** Medium — **CVSS 3.1 5.4** (`AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N`)
+**Weakness:** CWE-79 (Improper Neutralization of HTML) / CWE-1021 (Improper Restriction of Rendered UI Layers) — stored HTML/CSS injection, content spoofing / UI redressing
+**Date:** 2026-10-07
 
 ---
 
-## 1. Summary
+## Summary
 
-The connector **"Share a setup link"** feature lets an account owner delegate connector setup to an outside party, who can complete it **without signing in**. The link takes the form `https://hub.twominutereports.com/connect/<JWT>` and is resolved by a family of **`public/` (unauthenticated) API endpoints**.
+A Briefcase member can store HTML in the Briefcase **description** (and **post body**). The
+server-side sanitizer strips scripting vectors (`<script>`, `<img onerror>`, `<svg onload>`,
+event handlers, etc.) but **keeps structural tags (`<div>`, `<span>`, `<p>`, `<a>`, …) together
+with an arbitrary `style` attribute**. Because this content is rendered into the page with React
+`dangerouslySetInnerHTML` in the `app.configura.com` origin, an attacker can inject a
+`position:fixed`, full-viewport `<div>` that **covers the entire genuine MyConfigura page with
+attacker-controlled content** for every member who opens the shared briefcase — enabling
+convincing phishing (fake login/re-auth prompt on the real domain), UI redressing/clickjacking,
+and external tracking beacons.
 
-One of these, `POST /rmtipa/platform/public/connection-setup-link/context`, returns metadata about the link so the recipient's UI can show who invited them. In doing so it **discloses the inviting account owner's full name and email address** (plus the team name) to **anyone who holds the link, with no authentication of any kind**.
+This is **not** JavaScript execution (modern browsers do not execute `javascript:`/`expression()`
+in CSS); the impact is content spoofing / UI redress on a trusted, authenticated origin.
 
-Setup links are, by design, distributed to parties outside the account owner's organisation (agencies, clients, freelancers) and routinely travel over email and chat, where they can be forwarded, logged, or leaked via referrers. Any such recipient — intended or not — can read the owner's email address. The endpoint is **repeatable** for the link's 7-day lifetime.
+## Severity rationale
 
-This report covers **only** the unauthenticated PII disclosure. The server-side request forgery in the sibling `…/test` endpoint is documented separately.
+- **Stored & cross-user:** briefcases are shared; the payload is served to other members,
+  **including Configura employees** (posts render a verified-employee badge, confirming staff use
+  briefcases).
+- **Trusted origin:** the fake content appears on the real `https://app.configura.com` with a
+  valid certificate — ideal for credential-phishing.
+- **Low privilege to exploit:** any member who can edit a briefcase description/post.
+- Limited to spoofing/redress (no script execution, no direct data read) → **Medium**, not High.
 
----
+## Steps to reproduce
 
-## 2. Affected endpoint
+1. Log in to MyConfigura (`https://app.configura.com`) as any user who owns/administers a
+   briefcase (create one via **Briefcases → New briefcase**).
+2. Set the briefcase description to the payload below. Via the UI: open the briefcase →
+   **Settings** / edit description. Equivalent API request:
 
-| Item | Value |
-|---|---|
-| Endpoint | `POST https://hub.twominutereports.com/rmtipa/platform/public/connection-setup-link/context` |
-| Auth required | **None** — no `Authorization` header is sent |
-| Precondition | Possession of one valid, unexpired setup-link JWT (`…/connect/<JWT>`) |
-| Data disclosed | `invitedBy.name`, `invitedBy.email`, `teamName` |
-| Repeatable? | **Yes** — the `context` call does not consume the link (only `…/save` does) |
+   ```http
+   POST /api/v3/briefcases/edit HTTP/2
+   Host: www2.configura.com
+   Content-Type: application/json; charset=utf-8
+   x-csrf-token: <value of the myconfigura-csrf-token cookie>
+   Cookie: <your MyConfigura session cookies>
 
-The setup-link JWT is `HS256` with payload `{"setupLinkId":"<uuid>","type":"connection_setup_link","iat":…,"exp":+7d}`. The signature is correctly verified (forgery attempts — `alg:none`, algorithm-confusion, signature-stripping — were all rejected), so the link cannot be minted by an attacker. The issue is the data that the **valid** unauthenticated flow returns to whoever holds the link.
+   {"briefcaseId": <BRIEFCASE_ID>,
+    "briefcaseName": "santest",
+    "briefcaseDescription": "<div style=\"position:fixed;top:0;left:0;width:100%;height:100%;z-index:99999;background:#b30000;color:#fff;font-size:26px;padding:48px;font-family:sans-serif\">STORED HTML/CSS INJECTION &mdash; attacker-controlled full-page overlay rendered on app.configura.com. A real attacker could draw a fake login box here. <a href=\"https://example.com\">Continue</a></div>"}
+   ```
 
----
+3. The server responds `200` and stores the `style` attribute verbatim (confirmed: the stored
+   `description` still contains `position:fixed`).
+4. Open the briefcase in MyConfigura and click the **ℹ** (info) icon next to the briefcase name
+   (or any view that renders the description/post).
+5. **Result:** a full-viewport red overlay with attacker-controlled text and link is painted on
+   top of the genuine `app.configura.com` UI. See attached `03-stored-html-css-overlay.jpg`.
 
-## 3. Setup / prerequisites
+A real attacker would instead render a pixel-perfect fake "Your session expired — please sign in
+again" box and capture the credentials a victim enters, or use `background:url(//attacker/x.png)`
+as a read-receipt/tracking beacon.
 
-- **No Two Minute Reports account is required** to call the endpoint.
-- The attacker needs one valid, unexpired **setup link**. In the intended workflow these are generated by TMR users and sent to third parties to connect data sources.
-- Tooling: any HTTP client (`curl`, Burp Repeater).
+## Proof that script execution is NOT required / not possible here
 
-*(For a self-contained reproduction, a link can be minted with a normal user token via `POST /rmtipa/platform/generate-connection-setup-link` `{"connectorId":"apibridge","connectionName":"x"}`. Minting the link is the ordinary intended action; the finding is in what the unauthenticated `context` endpoint then returns.)*
+For transparency: the sanitizer does block JavaScript. I tested extensively — event handlers,
+`<script>/<img>/<svg>`, mXSS (`title`, `noscript`, `math`, `template`), and `data:`/`javascript:`
+URI tricks were all neutralized or isolated. The impact of **this** report is purely the stored
+HTML/CSS (overlay/phishing) described above.
 
----
+## Impact
 
-## 4. Proof of Concept
+- Credential phishing on the genuine Configura domain against other briefcase members and staff.
+- UI redressing / clickjacking of real MyConfigura controls.
+- Visitor tracking via externally-loaded CSS resources (`background:url(...)`).
 
-Let `JWT` be the token from a setup link (`…/connect/<JWT>`).
+## Remediation
 
-```bash
-curl -s 'https://hub.twominutereports.com/rmtipa/platform/public/connection-setup-link/context' \
-  -H 'Content-Type: application/json' \
-  --data '{"token":"<JWT>"}'
-```
+- **Remove the `style` attribute** from the allowed set (or restrict it to a vetted
+  property/value allowlist). Replace the custom filter with a maintained sanitizer such as
+  **DOMPurify** configured with a tag **and** attribute allowlist.
+- Add a Content-Security-Policy to `app.configura.com` with `script-src 'self'`,
+  `style-src 'self' 'unsafe-inline'`→tighten, and `img-src`/`default-src` restrictions to limit
+  external resource loads and future injection impact (currently only `frame-ancestors` is set).
+- Consider rendering user-supplied description/post content as plain text (or a safe Markdown
+  subset) rather than raw HTML.
 
-**No `Authorization` header is sent.** Observed response (`HTTP 200`):
+## Evidence (attached)
 
-```json
-{
-  "connectorId": "apibridge",
-  "connectionName": "x",
-  "mode": "create",
-  "teamName": "Hg266087's Team",
-  "invitedBy": {
-    "name": "Hg266087",
-    "email": "hg266087@gmail.com"
-  },
-  "status": "success"
-}
-```
+- `03-stored-html-css-overlay.jpg` — the stored payload rendering as a full-page overlay on
+  `https://app.configura.com/my/briefcases/<id>`.
+- `02-rendered-link-modal.jpg` — the description modal rendering injected HTML.
 
-The `invitedBy.email` and `invitedBy.name` fields are the account owner's real registered name and email address. The call succeeds with no credentials and can be repeated for the link's lifetime.
+## Notes for the triager
 
-End-to-end automation: `poc-unauth.sh` (step 2 is this unauthenticated `context` call; it sends no `Authorization` header).
-
----
-
-## 5. Impact
-
-Any party who receives or intercepts a setup link — including outside the intended recipient — can, **without any Two Minute Reports account or authentication**, obtain the inviting account owner's:
-
-- **Email address** (personal/registered) — usable for targeted phishing, credential-stuffing correlation, and account enumeration.
-- **Full name / display name.**
-- **Team name.**
-
-Because setup links are deliberately distributed to third parties and travel over channels that leak (email forwarding, chat, referrer headers, server logs), the exposed email address reaches a wider audience than the account owner intends. The disclosure is low in volume per link but requires no privileges and is fully repeatable, making it a reliable owner-email oracle for any link that leaks.
-
----
-
-## 6. Remediation
-
-1. **Remove the email address from the `context` response.** The recipient UI does not need the inviter's email; a display name (or the team name alone) is sufficient to establish trust in the invitation.
-2. If an inviter identity must be shown, prefer a **non-sensitive display name** over any contact address, and never return the raw registered email on an unauthenticated endpoint.
-3. Consider requiring the recipient to be an **authenticated user** before returning any inviter identity, and **rate-limit** the `public/connection-setup-link/*` endpoints.
-4. Shorten the setup-link lifetime and allow the inviter to **revoke** a link.
-
----
-
-## 7. Scope & rules-of-engagement compliance
-
-- Testing used **only the researcher's own account and setup link**; the only account data disclosed was the researcher's own (`Hg266087` / `hg266087@gmail.com`).
-- No other user's data was accessed; no enumeration or volume testing was performed.
-- The `context` call is read-only and does not persist or consume anything.
-
----
-
-## 8. Evidence files (this folder)
-
-| File | Contents |
-|---|---|
-| `poc-unauth.sh` | End-to-end PoC; **step 2** is the unauthenticated `context` call demonstrated here |
+- Testing used a throwaway account and a self-owned test briefcase; all test briefcases were
+  deleted afterward. No other users' data was accessed.
+- Related lower-severity observations submitted/under review separately: the sanitizer also
+  permits an isolated `javascript:` link (executes only in an opaque `about:blank` tab), and the
+  `myconfigura-session`/`-digest` cookies lack `HttpOnly`. These are defense-in-depth items and
+  not required for the impact above.
