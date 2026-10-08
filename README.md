@@ -1,123 +1,81 @@
-# Hardcoded catalogue-API secret credential in production `app.configura.com` JavaScript — accepted by the **production** catalogue API
+# Unhandled exception in JWT auth middleware — malformed `Authorization` crashes every request — HTTP 500 & internal error disclosure on `data.content-platform.configura.com`
 
 | | |
 |---|---|
 | **Program** | Configura Security Bug Bounty Program (Xposera) |
 | **Scope** | `*.configura.com` (in scope) |
-| **Leak location** | `https://app.configura.com/static/js/main.ad1c8c93.chunk.js` (production bundle, world-readable) |
-| **Credential type** | Catalogue-API secret token (`X-API-Key`, format `<id>.<secret>`) |
-| **Accepting hosts** | `catalogueapi-admin.configura.com` (**production**), `admin.api.stage.configura.com` / `api.stage.configura.com` (staging) |
-| **Weakness** | CWE-798 (Use of Hard-coded Credentials), CWE-522 (Insufficiently Protected Credentials), CWE-200 |
-| **Severity** | **Medium — CVSS 3.1 6.5** (`AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N`) as *demonstrated*; **conditional High (7–8)** if Configura confirms the key is authorized for any catalogue read/write (see §4) |
+| **Affected host** | `https://data.content-platform.configura.com` |
+| **Vulnerability** | Improper handling of exceptional conditions in authentication middleware; internal error-message disclosure |
+| **Weakness** | CWE-755 (Improper Handling of Exceptional Conditions), CWE-209 (Information Exposure Through an Error Message), CWE-248 (Uncaught Exception) |
+| **Severity** | **Medium — CVSS 3.1 5.3** (`AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N`; 5.3 is the Medium band, 4.0–6.9) |
 | **Date** | 2026-10-08 |
 
 ---
 
-## 1. Impact (why this matters)
+## Summary
 
-Configura ships a **secret** catalogue-API credential inside the production MyConfigura web app's
-JavaScript. Any anonymous visitor can copy it out of the static bundle. The credential is **not a
-public client id** — it is the `X-API-Key` secret that the bundled catalogue SDK uses to call the
-catalogue platform's **admin** and **content** APIs, and it is **accepted as a valid principal by
-the production catalogue API** (`catalogueapi-admin.configura.com`), not only staging.
+The `data.content-platform.configura.com` API authenticates requests with a JWT bearer token. Its
+auth middleware decodes the token **without null-checking the result**, so any `Authorization: Bearer`
+value that is not a decodable JWT makes the handler throw and the server respond with **HTTP 500** and
+an internal error message, instead of the correct **HTTP 401**:
 
-The catalogue platform is core Configura IP: it stores every manufacturer's product catalogues,
-pricing/price-lists, geometry and render assets, and the admin surface that the SDK exposes with this
-same `X-API-Key` includes manufacturer management, access-token issuance/activation, usage analytics,
-and infrastructure control (cache administration, DynamoDB refresh). A leaked credential to that
-platform is exactly the kind of secret that must never leave the server.
-
-Because a real secret for a privileged, production-recognised API is sitting in client code, this is
-reported as **Medium** on *demonstrated* facts, with a concrete path to **High** (§4) that only
-Configura's knowledge of the key's authorization scope can settle.
-
-## 2. The leak
-
-`app.configura.com/static/js/main.ad1c8c93.chunk.js` (production) contains, in clear text:
-
-```js
-e.auth = {
-  endpoint: "https://api.stage.configura.com",
-  secretToken: "STEUCE13JIVJ54VHZNCP2DSRNZB4I3EH.2UYEZLMYCIBIBQXR7VPPCHV2DVXATQ3R",
-  apiSession: { expires: "" }
-};
+```
+{"success":false,"message":"Cannot destructure property 'header' of 'object null' as it is null."}
 ```
 
-`secretToken` is a two-part `<key-id>.<secret>` value sent as the HTTP header `X-API-Key` (with
-`X-SDK-Version: 3.4.0`). The same bundle's catalogue SDK uses it against these endpoints:
+The message indicates the code does roughly `const { header } = jwt.decode(token, { complete: true })`
+and destructures `header` before checking that `jwt.decode()` returned non-null (it returns `null` for
+any string that is not a valid JWT). This is reachable by any unauthenticated attacker on every route.
 
-- **Admin:** `/catadmin/user`, `/catadmin/manufacturer/{id}/catalogues`,
-  `/catadmin/access-token/{pk}` and `/catadmin/access-token/{pk}/activate`,
-  `/catadmin/primary-access-token[/list]`, `/catadmin/aggregated-usage/{daily,hourly}`,
-  `/catadmin/admin/cache/{clear-keys,delete-key,scan,info,get}`, `/catadmin/admin/refresh-dynamo`,
-  `/catadmin/debug-browsing-session-token`.
-- **Content/viewer:** `/v2/catalogue/{cid}/{lang}/{enterprise}/{prdCat}/{prdCatVersion}/{vendor}/{priceList}[/{partNumber}]`,
-  `/v2/render/{uuid}`, `/v2/export/.../{partNumber}`, `/v2/session-token/refresh`.
+## Impact
 
-## 3. What is proven
+- **Improper input handling in the authentication layer.** Attacker-controlled input (the bearer
+  value) reaches an uncaught exception on the server; the correct response to a bad token is `401`,
+  not `500`. Exception-throwing auth code is fragile and a bad place to have unhandled paths.
+- **Internal error-message disclosure (CWE-209).** The response leaks an implementation detail (the
+  JWT-decode/destructure code path), which aids further attacks and fingerprints the stack.
+- Not a denial of service: the framework catches the exception and the service remains available
+  (verified — a subsequent no-token request still returns `401`).
 
-**(a) The secret is in the public production bundle** — see §2 (fetch the JS and `grep STEUCE`).
+Severity is **Medium (CVSS 5.3)**: a real defect in the authentication middleware where
+attacker-controlled input reaches an uncaught exception and the server discloses an internal error
+message (CWE-209). The `C:L` term is carried by that error-message disclosure; `I:N/A:N` because no
+integrity or availability impact is demonstrated (the framework catches the exception and the service
+stays up). The score sits at the lower end of the Medium band.
 
-**(b) The secret is a valid, recognised principal on the PRODUCTION catalogue API** — the server
-authenticates the key, then applies an authorization decision. Without the key the request is
-rejected at a different stage than with it:
+**Tested and NOT present (so it is not rated higher):** the signature verification itself is sound —
+structurally-valid forged tokens are correctly rejected with `401 "Invalid token"`, including
+`alg:none` (lower/upper/mixed case), empty-secret `HS256`, and common weak secrets. There is **no**
+authentication bypass; the only defect is the unhandled-exception / error-disclosure path on
+non-decodable input.
+
+## Steps to reproduce
 
 ```bash
-KEY='STEUCE13JIVJ54VHZNCP2DSRNZB4I3EH.2UYEZLMYCIBIBQXR7VPPCHV2DVXATQ3R'
+H=https://data.content-platform.configura.com
 
-# PRODUCTION admin catalogue API
-curl -s -w '%{http_code}\n' -o /dev/null                       https://catalogueapi-admin.configura.com/catadmin/user   # 400  (no key)
-curl -s -w '%{http_code}\n' -H "X-API-Key: $KEY" -o -          https://catalogueapi-admin.configura.com/catadmin/user
-#   -> 403 {"error":"403 Forbidden","code":403,"eventId":"5f1664f1fc6f48c7842963e4a5636769"}   (key recognised, this op forbidden)
+# Correct behaviour:
+curl -s -w '\n%{http_code}\n' "$H/v1"                                  # 401 "No authorization token was found"
+curl -s -w '\n%{http_code}\n' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.x' "$H/v1"   # 401 "Invalid token"
 
-# STAGING admin catalogue API — same recognition
-curl -s -w '%{http_code}\n' -o /dev/null                       https://admin.api.stage.configura.com/catadmin/user      # 404  (no key)
-curl -s -w '%{http_code}\n' -H "X-API-Key: $KEY" -o -          https://admin.api.stage.configura.com/catadmin/user
-#   -> 403  (key recognised)
+# Bug — any non-JWT bearer crashes the handler:
+curl -s -w '\n%{http_code}\n' -H 'Authorization: Bearer notajwt' "$H/v1"
+#  -> 500 {"success":false,"message":"Cannot destructure property 'header' of 'object null' as it is null."}
 ```
 
-`403` (authenticated-but-forbidden), not `401`, confirms the key is a **valid credential** the API
-accepts and attributes to a principal — on production and staging alike.
+Reproduced on `/`, `/v1`, `/v1/health`, `/v1/openapi.json`, `/metrics` with bearer values
+`notajwt`, `abc`, `a.b.c`, `x`. Sibling services (`gabana`, `lodzilla`, `puppetshow`, `categories`,
+`nxapi`, `thumbify`) correctly return `401` for the same input, so the defect is specific to this
+host's middleware.
 
-## 4. Demonstrated vs. conditional impact (the honest severity split)
+## Remediation
 
-- **Demonstrated (Medium):** a real secret catalogue-API credential is exposed in production client
-  code and is accepted by the production catalogue API. Every `/catadmin/*` **admin** operation I
-  tested returns `403` for this key, so I did **not** demonstrate an admin action, and I did not
-  touch any state-changing endpoint.
-- **Conditional (High) — one fact away:** the key's `/catadmin/user` being forbidden indicates it is
-  a catalogue **viewer/content** credential, whose natural authorization is the
-  `/v2/catalogue/...` read path. If that key is authorized to read manufacturer catalogue content
-  (products, pricing/price-lists, geometry) — especially for catalogues beyond a single demo
-  manufacturer — then the leak discloses proprietary multi-tenant manufacturer data to any anonymous
-  user, which is a **High** confidentiality impact. I could not confirm this only because the
-  `/v2/catalogue` read requires a valid `cid/lang/enterprise/prdCat/prdCatVersion/vendor/priceList`
-  tuple that I could not enumerate (the catalogue-listing operations are themselves `403`). **Configura
-  can settle this immediately by checking what the key `STEUCE13…ATQ3R` is scoped to.** If it grants
-  catalogue reads (or any write), treat this as High and re-score
-  (`AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` = 7.5, or higher with integrity).
+- Null-check the decode result before destructuring, e.g.
+  `const decoded = jwt.decode(token, { complete: true }); if (!decoded) return res.status(401)...;`
+  — and wrap token verification in try/catch so any parse/verify failure returns `401`, never `500`.
+- Return a generic `401` body; do not echo internal exception text to clients.
 
-## 5. Attack chain
+## Evidence
 
-1. Anonymous attacker loads `app.configura.com`, opens the JS bundle, extracts `secretToken`.
-2. Attacker replays it as `X-API-Key` directly against `catalogueapi-admin.configura.com` /
-   `api.stage.configura.com` — no login, no CSRF, no user interaction. The production API accepts the
-   credential (§3).
-3. Attacker exercises whatever that credential is authorized for on the catalogue platform. At
-   minimum the credential is valid indefinitely (it has no client-side expiry: `apiSession.expires: ""`)
-   until Configura rotates it; at worst (per §4) it reads proprietary catalogue content.
-
-## 6. Remediation
-
-- **Rotate `STEUCE13…ATQ3R` now** — it is permanently compromised by shipping in a public bundle.
-- **Remove the secret from client code.** The browser must never hold a catalogue *secret* token.
-  Proxy catalogue calls through the app's own backend, or hand the browser a **short-lived,
-  least-privilege public access token** scoped to exactly the catalogue it may view (the API already
-  models this via `/v2/access-token/public/{id}/authorize`).
-- **Confirm scope / blast radius:** verify what `STEUCE13…ATQ3R` is authorized for on **production**
-  (`catalogueapi-admin.configura.com`) and whether any other hardcoded keys exist in shipped bundles.
-
-## 7. Evidence
-
-- `evidence/21-hardcoded-stage-key.txt` — bundle excerpt, full endpoint surface, and the observed
-  production + staging recognition (`403` with key, `400`/`404` without).
+- `evidence/22-data-cp-jwt-500.txt` — full request/response matrix (clean 401 vs 500 crash, sibling
+  comparison, stability check).
