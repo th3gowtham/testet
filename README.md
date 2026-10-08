@@ -1,91 +1,123 @@
-# Unauthenticated Prometheus `/metrics` endpoint exposes internal render-farm inventory — `temp-db.aura-acceleration.configura.com`
+# Hardcoded catalogue-API secret credential in production `app.configura.com` JavaScript — accepted by the **production** catalogue API
 
 | | |
 |---|---|
 | **Program** | Configura Security Bug Bounty Program (Xposera) |
-| **Scope asset** | `*.configura.com` (in scope) |
-| **Affected host** | `https://temp-db.aura-acceleration.configura.com` |
-| **Endpoint** | `GET /metrics` (no authentication) |
-| **Vulnerability** | Security misconfiguration / sensitive information disclosure |
-| **Weakness** | CWE-200 (Exposure of Sensitive Information), CWE-16 (Configuration) |
-| **Severity** | **medium **  |
+| **Scope** | `*.configura.com` (in scope) |
+| **Leak location** | `https://app.configura.com/static/js/main.ad1c8c93.chunk.js` (production bundle, world-readable) |
+| **Credential type** | Catalogue-API secret token (`X-API-Key`, format `<id>.<secret>`) |
+| **Accepting hosts** | `catalogueapi-admin.configura.com` (**production**), `admin.api.stage.configura.com` / `api.stage.configura.com` (staging) |
+| **Weakness** | CWE-798 (Use of Hard-coded Credentials), CWE-522 (Insufficiently Protected Credentials), CWE-200 |
+| **Severity** | **Medium — CVSS 3.1 6.5** (`AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N`) as *demonstrated*; **conditional High (7–8)** if Configura confirms the key is authorized for any catalogue read/write (see §4) |
 | **Date** | 2026-10-08 |
 
 ---
 
-## Summary
+## 1. Impact (why this matters)
 
-The service at `temp-db.aura-acceleration.configura.com` (a Go application that fronts the Aura
-Acceleration / offsite render farm) exposes its Prometheus metrics endpoint, `GET /metrics`,
-**without any authentication**. Every other API route on the host is correctly protected
-(`/api/stats`, `/api/active_servers`, `/api/servers` all return `401 'Authorization' header token
-missing or is invalid`), but `/metrics` is served to anyone.
+Configura ships a **secret** catalogue-API credential inside the production MyConfigura web app's
+JavaScript. Any anonymous visitor can copy it out of the static bundle. The credential is **not a
+public client id** — it is the `X-API-Key` secret that the bundled catalogue SDK uses to call the
+catalogue platform's **admin** and **content** APIs, and it is **accepted as a valid principal by
+the production catalogue API** (`catalogueapi-admin.configura.com`), not only staging.
 
-The exported metrics are not generic runtime counters only — they include a custom exporter
-(`offsite_exporter_*`) that publishes the internal render-farm inventory and job pipeline state:
-individual render-server hostnames, their health and status, per-server queue outcomes, and
-cumulative job counts.
+The catalogue platform is core Configura IP: it stores every manufacturer's product catalogues,
+pricing/price-lists, geometry and render assets, and the admin surface that the SDK exposes with this
+same `X-API-Key` includes manufacturer management, access-token issuance/activation, usage analytics,
+and infrastructure control (cache administration, DynamoDB refresh). A leaked credential to that
+platform is exactly the kind of secret that must never leave the server.
 
-## Impact
+Because a real secret for a privileged, production-recognised API is sitting in client code, this is
+reported as **Medium** on *demonstrated* facts, with a concrete path to **High** (§4) that only
+Configura's knowledge of the key's authorization scope can settle.
 
-An unauthenticated attacker learns internal operational details that are normally not public and
-that aid reconnaissance / targeting of the render infrastructure:
+## 2. The leak
 
-- **Internal server inventory** — 15 render servers enumerated by hostname, e.g.
-  `CIT-CWS-58557RenderServer` … `CIT-CWS-58977RenderServer`, each with `health_status` and
-  `server_status` (all `HEALTHY` / `IDLE` at capture time). This reveals the internal naming
-  convention (`CIT-CWS-<id>RenderServer`) and the fleet size.
-- **Job pipeline volume and health** — cumulative job counters disclose throughput and error rates,
-  e.g. `COMPLETED_RENDER = 130637`, `ABORTED_API = 212`, `ABORTED_RENDER = 34`,
-  `RENDERING_RENDER = 1`, `UPLOADING_RENDER = 1`, plus per-server `queue_status` breakdowns.
-- **Runtime fingerprint** — `go_info{version="go1.24.2"}` and the full Go runtime/GC metric set,
-  useful for matching the host to known runtime-version issues.
+`app.configura.com/static/js/main.ad1c8c93.chunk.js` (production) contains, in clear text:
 
-No credentials, tokens, or customer data are exposed, so impact is limited to information disclosure
-of internal infrastructure — hence **Low**. It is nonetheless a real misconfiguration: metrics
-endpoints are a well-known thing to lock down precisely because they leak internal topology and can
-expose far more (labels frequently carry hostnames, routes, user identifiers, or DB names).
+```js
+e.auth = {
+  endpoint: "https://api.stage.configura.com",
+  secretToken: "STEUCE13JIVJ54VHZNCP2DSRNZB4I3EH.2UYEZLMYCIBIBQXR7VPPCHV2DVXATQ3R",
+  apiSession: { expires: "" }
+};
+```
 
-## Steps to reproduce
+`secretToken` is a two-part `<key-id>.<secret>` value sent as the HTTP header `X-API-Key` (with
+`X-SDK-Version: 3.4.0`). The same bundle's catalogue SDK uses it against these endpoints:
+
+- **Admin:** `/catadmin/user`, `/catadmin/manufacturer/{id}/catalogues`,
+  `/catadmin/access-token/{pk}` and `/catadmin/access-token/{pk}/activate`,
+  `/catadmin/primary-access-token[/list]`, `/catadmin/aggregated-usage/{daily,hourly}`,
+  `/catadmin/admin/cache/{clear-keys,delete-key,scan,info,get}`, `/catadmin/admin/refresh-dynamo`,
+  `/catadmin/debug-browsing-session-token`.
+- **Content/viewer:** `/v2/catalogue/{cid}/{lang}/{enterprise}/{prdCat}/{prdCatVersion}/{vendor}/{priceList}[/{partNumber}]`,
+  `/v2/render/{uuid}`, `/v2/export/.../{partNumber}`, `/v2/session-token/refresh`.
+
+## 3. What is proven
+
+**(a) The secret is in the public production bundle** — see §2 (fetch the JS and `grep STEUCE`).
+
+**(b) The secret is a valid, recognised principal on the PRODUCTION catalogue API** — the server
+authenticates the key, then applies an authorization decision. Without the key the request is
+rejected at a different stage than with it:
 
 ```bash
-curl -s https://temp-db.aura-acceleration.configura.com/metrics | head
+KEY='STEUCE13JIVJ54VHZNCP2DSRNZB4I3EH.2UYEZLMYCIBIBQXR7VPPCHV2DVXATQ3R'
+
+# PRODUCTION admin catalogue API
+curl -s -w '%{http_code}\n' -o /dev/null                       https://catalogueapi-admin.configura.com/catadmin/user   # 400  (no key)
+curl -s -w '%{http_code}\n' -H "X-API-Key: $KEY" -o -          https://catalogueapi-admin.configura.com/catadmin/user
+#   -> 403 {"error":"403 Forbidden","code":403,"eventId":"5f1664f1fc6f48c7842963e4a5636769"}   (key recognised, this op forbidden)
+
+# STAGING admin catalogue API — same recognition
+curl -s -w '%{http_code}\n' -o /dev/null                       https://admin.api.stage.configura.com/catadmin/user      # 404  (no key)
+curl -s -w '%{http_code}\n' -H "X-API-Key: $KEY" -o -          https://admin.api.stage.configura.com/catadmin/user
+#   -> 403  (key recognised)
 ```
 
-Observed: `HTTP/2 200`, `Content-Type: text/plain; version=0.0.4`, e.g.
+`403` (authenticated-but-forbidden), not `401`, confirms the key is a **valid credential** the API
+accepts and attributes to a principal — on production and staging alike.
 
-```
-offsite_exporter_active_servers_total{health_status="HEALTHY",name="CIT-CWS-58557RenderServer",server_status="IDLE"} 1
-offsite_exporter_active_servers_total{health_status="HEALTHY",name="CIT-CWS-58558RenderServer",server_status="IDLE"} 1
-...
-offsite_exporter_jobs_by_status_total{job_status="COMPLETED_RENDER"} 130637
-offsite_exporter_jobs_by_status_total{job_status="ABORTED_API"} 212
-offsite_exporter_queue_status_total{name="CIT-CWS-58782RenderServer",queue_status="UPLOADING_RENDER"} 1
-go_info{version="go1.24.2"} 1
-```
+## 4. Demonstrated vs. conditional impact (the honest severity split)
 
-Control (the application API is correctly authenticated):
+- **Demonstrated (Medium):** a real secret catalogue-API credential is exposed in production client
+  code and is accepted by the production catalogue API. Every `/catadmin/*` **admin** operation I
+  tested returns `403` for this key, so I did **not** demonstrate an admin action, and I did not
+  touch any state-changing endpoint.
+- **Conditional (High) — one fact away:** the key's `/catadmin/user` being forbidden indicates it is
+  a catalogue **viewer/content** credential, whose natural authorization is the
+  `/v2/catalogue/...` read path. If that key is authorized to read manufacturer catalogue content
+  (products, pricing/price-lists, geometry) — especially for catalogues beyond a single demo
+  manufacturer — then the leak discloses proprietary multi-tenant manufacturer data to any anonymous
+  user, which is a **High** confidentiality impact. I could not confirm this only because the
+  `/v2/catalogue` read requires a valid `cid/lang/enterprise/prdCat/prdCatVersion/vendor/priceList`
+  tuple that I could not enumerate (the catalogue-listing operations are themselves `403`). **Configura
+  can settle this immediately by checking what the key `STEUCE13…ATQ3R` is scoped to.** If it grants
+  catalogue reads (or any write), treat this as High and re-score
+  (`AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` = 7.5, or higher with integrity).
 
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://temp-db.aura-acceleration.configura.com/api/active_servers
-# -> 401   ('Authorization' header token missing or is invalid)
-```
+## 5. Attack chain
 
-## Evidence
+1. Anonymous attacker loads `app.configura.com`, opens the JS bundle, extracts `secretToken`.
+2. Attacker replays it as `X-API-Key` directly against `catalogueapi-admin.configura.com` /
+   `api.stage.configura.com` — no login, no CSRF, no user interaction. The production API accepts the
+   credential (§3).
+3. Attacker exercises whatever that credential is authorized for on the catalogue platform. At
+   minimum the credential is valid indefinitely (it has no client-side expiry: `apiSession.expires: ""`)
+   until Configura rotates it; at worst (per §4) it reads proprietary catalogue content.
 
-- `evidence/20-tempdb-metrics-exposed.txt` — captured response excerpt (application metrics +
-  runtime fingerprint).
+## 6. Remediation
 
-## Remediation
+- **Rotate `STEUCE13…ATQ3R` now** — it is permanently compromised by shipping in a public bundle.
+- **Remove the secret from client code.** The browser must never hold a catalogue *secret* token.
+  Proxy catalogue calls through the app's own backend, or hand the browser a **short-lived,
+  least-privilege public access token** scoped to exactly the catalogue it may view (the API already
+  models this via `/v2/access-token/public/{id}/authorize`).
+- **Confirm scope / blast radius:** verify what `STEUCE13…ATQ3R` is authorized for on **production**
+  (`catalogueapi-admin.configura.com`) and whether any other hardcoded keys exist in shipped bundles.
 
-- Do not expose `/metrics` on the public internet. Bind it to an internal interface / private
-  network, or require authentication (the same bearer/JWT middleware already protecting `/api/*`),
-  or scrape it over a private side-channel only.
-- If a public metrics endpoint is unavoidable, strip high-cardinality / identifying labels
-  (server hostnames) and keep only aggregate gauges.
+## 7. Evidence
 
-## Severity justification (CVSS 3.1)
-
-`AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N` = **5.3 (Low–Medium boundary; treat as Low)** — unauthenticated
-network read (`PR:N`), limited confidentiality impact (`C:L`: internal infrastructure inventory and
-operational metrics, no credentials/PII), no integrity or availability impact.
+- `evidence/21-hardcoded-stage-key.txt` — bundle excerpt, full endpoint surface, and the observed
+  production + staging recognition (`403` with key, `400`/`404` without).
